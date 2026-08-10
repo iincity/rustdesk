@@ -47,6 +47,7 @@ unix-file-copy-paste = [
     "clipboard/unix-file-copy-paste",
 ]
 screencapturekit = ["cpal/screencapturekit"]
+nexus = ["dep:nexus_client"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -54,6 +55,7 @@ screencapturekit = ["cpal/screencapturekit"]
 async-trait = "0.1"
 scrap = { path = "libs/scrap", features = ["wayland"] }
 hbb_common = { path = "libs/hbb_common" }
+nexus_client = { path = "libs/nexus_client", optional = true }
 serde_derive = "1.0"
 serde = "1.0"
 serde_json = "1.0"
@@ -211,7 +213,7 @@ jni = "0.21"
 android-wakelock = { git = "https://github.com/rustdesk-org/android-wakelock" }
 
 [workspace]
-members = ["libs/scrap", "libs/hbb_common", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer"]
+members = ["libs/scrap", "libs/hbb_common", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer", "libs/nexus_client"]
 exclude = ["vdi/host", "examples/custom_plugin"]
 
 # Patch libxdo-sys to use a stub implementation that doesn't require libxdo

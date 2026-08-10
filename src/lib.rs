@@ -1,4 +1,7 @@
 mod keyboard;
+
+#[cfg(feature = "nexus")]
+pub mod nexus;
 /// cbindgen:ignore
 pub mod platform;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

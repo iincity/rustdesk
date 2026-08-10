@@ -5092,6 +5092,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus_client"
+version = "0.1.0"
+
+[[package]]
 name = "nix"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7310,6 +7314,7 @@ dependencies = [
  "libxdo-sys",
  "mac_address",
  "magnum-opus",
+ "nexus_client",
  "nix 0.29.0",
  "num_cpus",
  "objc",
