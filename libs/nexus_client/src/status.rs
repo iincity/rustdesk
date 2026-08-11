@@ -1,4 +1,4 @@
-use crate::tunnel::TunnelState;
+use crate::tunnel::TunnelStatus;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HealthState {
@@ -10,5 +10,5 @@ pub enum HealthState {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClientStatus {
     pub health: HealthState,
-    pub tunnel: TunnelState,
+    pub tunnel: TunnelStatus,
 }

@@ -5,5 +5,8 @@ edition = "2021"
 rust-version = "1.75"
 publish = false
 
+[dependencies]
+nexus-tunnel-client = { git = "https://github.com/iincity/nexus-tunnel.git", rev = "75bc36d0a5a27c2cb1cba9feaa8771806f7924ae" }
+
 [lib]
 path = "src/lib.rs"

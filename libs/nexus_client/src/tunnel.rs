@@ -1,10 +1,5 @@
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TunnelState {
-    #[default]
-    Disabled,
-    PresenceOnly,
-    Activating,
-    Active,
-    Draining,
-    Backoff,
-}
+pub use nexus_tunnel_client::{
+    ApplyError, ConfigDigest, ConfigVersion, Transition, TunnelDesiredState, TunnelMode,
+    TunnelPolicy, TunnelRoute, TunnelRuntime, TunnelService, TunnelState, TunnelStatus,
+    TransportProtocol,
+};

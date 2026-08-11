@@ -12,4 +12,8 @@ impl DeviceIdentity {
             device_uid: None,
         }
     }
+
+    pub fn bind_device_uid(&mut self, device_uid: impl Into<String>) {
+        self.device_uid = Some(device_uid.into());
+    }
 }
