@@ -590,6 +590,14 @@ pub async fn start_server(is_server: bool, no_server: bool) {
     });
 
     if is_server {
+        #[cfg(feature = "nexus")]
+        let _nexus_runtime = crate::nexus::start_runtime(
+            Config::get_id(),
+            Config::file()
+                .parent()
+                .map(|path| path.to_path_buf())
+                .unwrap_or_else(Config::get_home),
+        );
         crate::common::set_server_running(true);
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {
