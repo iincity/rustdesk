@@ -353,6 +353,9 @@ pub enum Data {
     SAS,
     UserSid(Option<u32>),
     OnlineStatus(Option<(i64, bool)>),
+    /// Feature-gated, read-only NexusFlow status on the already-authorized main IPC.
+    #[cfg(feature = "nexus")]
+    NexusStatus(Option<NexusStatus>),
     Config((String, Option<String>)),
     Options(Option<HashMap<String, String>>),
     NatType(Option<i32>),
@@ -544,6 +547,20 @@ pub enum Data {
         hotx: i32,
         hoty: i32,
     },
+}
+
+/// Stable, non-sensitive status returned to the local RustDesk GUI.
+///
+/// Desired State payloads, keys, tokens and routes deliberately do not cross
+/// this IPC boundary.
+#[cfg(feature = "nexus")]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct NexusStatus {
+    pub version: u16,
+    pub health: String,
+    pub tunnel_state: String,
+    pub desired_version: Option<u64>,
+    pub applied_version: Option<u64>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -842,6 +859,14 @@ async fn handle(data: Data, stream: &mut Connection) {
             let x = config::get_online_state();
             let confirmed = Config::get_key_confirmed();
             allow_err!(stream.send(&Data::OnlineStatus(Some((x, confirmed)))).await);
+        }
+        #[cfg(feature = "nexus")]
+        Data::NexusStatus(None) => {
+            allow_err!(stream.send(&Data::NexusStatus(Some(crate::nexus::ipc_status()))).await);
+        }
+        #[cfg(feature = "nexus")]
+        Data::NexusStatus(Some(_)) => {
+            log::warn!("Rejected Nexus status response sent to server IPC");
         }
         Data::ConfirmedKey(None) => {
             let out = if Config::get_key_confirmed() {
@@ -2216,6 +2241,25 @@ mod test {
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
+    }
+
+    #[cfg(feature = "nexus")]
+    #[test]
+    fn nexus_status_ipc_payload_round_trips() {
+        let request = Data::NexusStatus(None);
+        let request: Data = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(matches!(request, Data::NexusStatus(None)));
+
+        let response = Data::NexusStatus(Some(NexusStatus {
+            version: nexus_client::ipc::IPC_VERSION,
+            health: "running".into(),
+            tunnel_state: "presence-only".into(),
+            desired_version: Some(1),
+            applied_version: Some(1),
+        }));
+        let response: Data =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(matches!(response, Data::NexusStatus(Some(status)) if status.health == "running"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

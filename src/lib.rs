@@ -62,6 +62,9 @@ mod whiteboard;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod updater;
 
+#[cfg(feature = "nexus-e2e-host")]
+pub mod ui_cm_interface;
+#[cfg(not(feature = "nexus-e2e-host"))]
 mod ui_cm_interface;
 mod ui_interface;
 mod ui_session_interface;

@@ -123,11 +123,9 @@ pub const LOGIN_SCREEN_WAYLAND: &str = "Wayland login screen is not supported";
 #[cfg(target_os = "linux")]
 pub const SCRAP_UBUNTU_HIGHER_REQUIRED: &str = "ubuntu-21-04-required";
 #[cfg(target_os = "linux")]
-pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
-    "wayland-requires-higher-linux-version";
+pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str = "wayland-requires-higher-linux-version";
 #[cfg(target_os = "linux")]
-pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
-    "xdp-portal-unavailable";
+pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str = "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
@@ -207,6 +205,17 @@ impl Client {
         (i32, String),
     )> {
         debug_assert!(peer == interface.get_id());
+        #[cfg(feature = "nexus-native-tunnel")]
+        if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP)
+            && crate::nexus::native_port_forward_context_required(
+                &interface.get_lch().read().unwrap().port_forward,
+            )
+        {
+            let target = interface.get_lch().read().unwrap().port_forward.clone();
+            if crate::nexus::native_port_forward_context(&target).is_none() {
+                bail!("Nexus PortForward credential is invalid, expired, or revoked");
+            }
+        }
         interface.update_direct(None);
         interface.update_received(false);
         match Self::_start(peer, key, token, conn_type, interface.clone()).await {
@@ -313,11 +322,46 @@ impl Client {
         }
 
         let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
+        let force_kcp = matches!(conn_type, ConnType::PORT_FORWARD)
+            && std::env::var("NEXUS_E2E_FORCE_KCP").as_deref() == Ok("1");
+        if force_kcp {
+            log::info!(
+                "NEXUS_E2E_FORCE_KCP: udp_enabled={} interface_force_relay={}",
+                crate::get_udp_punch_enabled(),
+                interface.is_force_relay()
+            );
+        }
         let udp =
         // no need to care about multiple rendezvous servers case, since it is acutally not used any more.
         // Shared state for UDP NAT test result
-        if crate::get_udp_punch_enabled() && !interface.is_force_relay() {
-            if let Ok((socket, addr)) = new_direct_udp_for(&rendezvous_server).await {
+        if (crate::get_udp_punch_enabled() || force_kcp) && !interface.is_force_relay() {
+            if force_kcp {
+                log::info!(
+                    "NEXUS_E2E_FORCE_KCP: creating UDP candidate for rendezvous {}",
+                    rendezvous_server
+                );
+            }
+            let udp_target = match new_direct_udp_for(&rendezvous_server).await {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    if force_kcp {
+                        log::warn!(
+                            "NEXUS_E2E_FORCE_KCP: failed to create UDP candidate for {}: {}",
+                            rendezvous_server,
+                            error
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some((socket, addr)) = udp_target {
+                if force_kcp {
+                    log::info!(
+                        "NEXUS_E2E_FORCE_KCP: UDP candidate socket={} rendezvous={}",
+                        socket.local_addr().unwrap_or_else(|_| config::Config::get_any_listen_addr(addr.is_ipv4())),
+                        addr
+                    );
+                }
                 let udp_port = Arc::new(Mutex::new(0));
                 let up_cloned = udp_port.clone();
                 let socket_cloned = socket.clone();
@@ -325,8 +369,32 @@ impl Client {
                     allow_err!(test_udp_uat(socket_cloned, addr, up_cloned, stop_udp_rx).await);
                 };
                 tokio::spawn(func);
+                // The forced KCP fixture must advertise the UDP candidate in
+                // its first PunchHoleRequest. The native NAT probe runs in a
+                // background task, so give that probe a short test-only
+                // window to receive hbbs' response before _start_inner reads
+                // the candidate port. Production registration timing is
+                // unchanged.
+                if force_kcp {
+                    for _ in 0..50 {
+                        if *udp_port.lock().unwrap() > 0 {
+                            break;
+                        }
+                        hbb_common::sleep(0.01).await;
+                    }
+                    log::info!(
+                        "NEXUS_E2E_FORCE_KCP: UDP NAT candidate port={}",
+                        *udp_port.lock().unwrap()
+                    );
+                }
                 (Some(socket), Some(udp_port))
             } else {
+                if force_kcp {
+                    log::warn!(
+                        "NEXUS_E2E_FORCE_KCP: failed to create UDP candidate for {}",
+                        rendezvous_server
+                    );
+                }
                 (None, None)
             }
         } else {
@@ -349,19 +417,23 @@ impl Client {
         }
         let mut connect_futures = Vec::new();
         connect_futures.push(fut.boxed());
-        let fut = Self::_start_inner(
-            peer.to_owned(),
-            key.to_owned(),
-            token.to_owned(),
-            conn_type,
-            interface,
-            (None, None),
-            None,
-            rendezvous_server,
-            servers,
-            contained,
-        );
-        connect_futures.push(fut.boxed());
+        // A forced KCP fixture must not race a second TCP-only attempt; the
+        // normal production path keeps this fallback unchanged.
+        if !force_kcp {
+            let fut = Self::_start_inner(
+                peer.to_owned(),
+                key.to_owned(),
+                token.to_owned(),
+                conn_type,
+                interface,
+                (None, None),
+                None,
+                rendezvous_server,
+                servers,
+                contained,
+            );
+            connect_futures.push(fut.boxed());
+        }
         match select_ok(connect_futures).await {
             Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
             Err(e) => Err(e),
@@ -390,6 +462,8 @@ impl Client {
         (i32, String),
         bool,
     )> {
+        let force_kcp = matches!(conn_type, ConnType::PORT_FORWARD)
+            && std::env::var("NEXUS_E2E_FORCE_KCP").as_deref() == Ok("1");
         let mut start = Instant::now();
         let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
         debug_assert!(!servers.contains(&rendezvous_server));
@@ -419,6 +493,8 @@ impl Client {
         let my_nat_type = crate::get_nat_type(100).await;
         let mut is_local = false;
         let mut feedback = 0;
+        #[cfg(feature = "nexus-native-tunnel")]
+        let nexus_admission = interface.get_nexus_relay_admission(conn_type);
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
@@ -470,6 +546,8 @@ impl Client {
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             switch_code,
+            #[cfg(feature = "nexus-native-tunnel")]
+            nexus_admission: nexus_admission.clone().into(),
             ..Default::default()
         });
         for i in 1..=3 {
@@ -514,7 +592,7 @@ impl Client {
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
                             let s = udp.0.take();
-                            if ph.is_udp && s.is_some() {
+                            if (ph.is_udp || force_kcp) && s.is_some() {
                                 if let Some(s) = s {
                                     allow_err!(s.connect(peer_addr).await);
                                     udp.0 = Some(s);
@@ -559,6 +637,8 @@ impl Client {
                             &key,
                             conn_type,
                             my_addr.is_ipv4(),
+                            #[cfg(feature = "nexus-native-tunnel")]
+                            rr.nexus_admission.into_option(),
                         );
                         connect_futures.push(
                             async move {
@@ -625,6 +705,8 @@ impl Client {
                 udp.0,
                 ipv6.0,
                 punch_type,
+                #[cfg(feature = "nexus-native-tunnel")]
+                nexus_admission,
             )
             .await?,
             (feedback, rendezvous_server),
@@ -651,6 +733,7 @@ impl Client {
         udp_socket_nat: Option<Arc<UdpSocket>>,
         udp_socket_v6: Option<Arc<UdpSocket>>,
         punch_type: &str,
+        #[cfg(feature = "nexus-native-tunnel")] nexus_admission: Option<NexusRelayAdmission>,
     ) -> ResultType<(
         Stream,
         bool,
@@ -694,24 +777,40 @@ impl Client {
         let start = std::time::Instant::now();
 
         let mut connect_futures = Vec::new();
-        let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-        connect_futures.push(
-            async move {
-                let conn = fut.await?;
-                Ok((conn, None, "TCP"))
-            }
-            .boxed(),
-        );
+        // Test-only KCP coverage must prevent the local TCP candidate from
+        // winning the race. Production behavior is unchanged unless the
+        // explicitly test-scoped environment variable is present.
+        let force_kcp = matches!(conn_type, ConnType::PORT_FORWARD)
+            && std::env::var("NEXUS_E2E_FORCE_KCP").as_deref() == Ok("1");
+        if !force_kcp {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP"))
+                }
+                .boxed(),
+            );
+        } else {
+            log::info!("NEXUS_E2E_FORCE_KCP: skipping TCP candidate for PortForward");
+        }
         if let Some(udp_socket_nat) = udp_socket_nat {
             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
         }
         if let Some(udp_socket_v6) = udp_socket_v6 {
             connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
         }
-        // Run all connection attempts concurrently, return the first successful one
-        let (mut conn, kcp, mut typ) = match select_ok(connect_futures).await {
-            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-            Err(e) => (Err(e), None, ""),
+        // Run all connection attempts concurrently, return the first successful one.
+        // A test-only forced KCP run may have no UDP candidate; let the normal
+        // relay fallback produce the protocol error instead of panicking in
+        // futures-util's empty select_ok.
+        let (mut conn, kcp, mut typ) = if connect_futures.is_empty() {
+            (Err(anyhow!("no native connection candidates")), None, "")
+        } else {
+            match select_ok(connect_futures).await {
+                Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
+                Err(e) => (Err(e), None, ""),
+            }
         };
 
         let mut direct = !conn.is_err();
@@ -727,6 +826,8 @@ impl Client {
                     token,
                     conn_type,
                     &switch_code,
+                    #[cfg(feature = "nexus-native-tunnel")]
+                    nexus_admission,
                 )
                 .await;
                 if let Err(e) = conn {
@@ -848,6 +949,7 @@ impl Client {
         token: &str,
         conn_type: ConnType,
         switch_code: &str,
+        #[cfg(feature = "nexus-native-tunnel")] nexus_admission: Option<NexusRelayAdmission>,
     ) -> ResultType<Stream> {
         let mut succeed = false;
         let mut uuid = "".to_owned();
@@ -881,6 +983,8 @@ impl Client {
                 relay_server: relay_server.clone(),
                 secure,
                 switch_code: switch_code.to_owned(),
+                #[cfg(feature = "nexus-native-tunnel")]
+                nexus_admission: nexus_admission.clone().into(),
                 ..Default::default()
             });
             socket.send(&msg_out).await?;
@@ -900,7 +1004,17 @@ impl Client {
         if !succeed {
             bail!("Timeout");
         }
-        Self::create_relay(peer, uuid, relay_server, key, conn_type, ipv4).await
+        Self::create_relay(
+            peer,
+            uuid,
+            relay_server,
+            key,
+            conn_type,
+            ipv4,
+            #[cfg(feature = "nexus-native-tunnel")]
+            nexus_admission,
+        )
+        .await
     }
 
     /// Create a relay connection to the server.
@@ -911,6 +1025,7 @@ impl Client {
         key: &str,
         conn_type: ConnType,
         ipv4: bool,
+        #[cfg(feature = "nexus-native-tunnel")] nexus_admission: Option<NexusRelayAdmission>,
     ) -> ResultType<Stream> {
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
@@ -924,6 +1039,8 @@ impl Client {
             id: peer.to_owned(),
             uuid,
             conn_type: conn_type.into(),
+            #[cfg(feature = "nexus-native-tunnel")]
+            nexus_admission: nexus_admission.into(),
             ..Default::default()
         });
         conn.send(&msg_out).await?;
@@ -2684,16 +2801,15 @@ impl LoginConfigHandler {
         };
         let mut avatar = get_builtin_option(keys::OPTION_AVATAR);
         if avatar.is_empty() {
-            avatar = serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option(
-                "user_info",
-            ))
-            .ok()
-            .and_then(|x| {
-                x.get("avatar")
-                    .and_then(|x| x.as_str())
-                    .map(|x| x.trim().to_owned())
-            })
-            .unwrap_or_default();
+            avatar =
+                serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option("user_info"))
+                    .ok()
+                    .and_then(|x| {
+                        x.get("avatar")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x.trim().to_owned())
+                    })
+                    .unwrap_or_default();
         }
         avatar = resolve_avatar_url(avatar);
         let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);
@@ -2768,6 +2884,8 @@ impl LoginConfigHandler {
             ConnType::PORT_FORWARD | ConnType::RDP => lr.set_port_forward(PortForward {
                 host: self.port_forward.0.clone(),
                 port: self.port_forward.1,
+                #[cfg(feature = "nexus-native-tunnel")]
+                nexus_context: crate::nexus::native_port_forward_context(&self.port_forward).into(),
                 ..Default::default()
             }),
             ConnType::TERMINAL => {
@@ -3474,11 +3592,7 @@ async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
         return false;
     }
     match conn.next_timeout(1000).await {
-        Ok(Some(crate::ipc::Data::SwitchSidesUuid(
-            returned_uuid,
-            returned_id,
-            Some(true),
-        ))) => {
+        Ok(Some(crate::ipc::Data::SwitchSidesUuid(returned_uuid, returned_id, Some(true)))) => {
             returned_uuid == uuid && returned_id == id
         }
         _ => false,
@@ -3768,6 +3882,26 @@ pub trait Interface: Send + Clone + 'static + Sized {
         }
     }
 
+    #[cfg(feature = "nexus-native-tunnel")]
+    fn get_nexus_relay_admission(&self, conn_type: ConnType) -> Option<NexusRelayAdmission> {
+        let target = self.get_lch().read().unwrap().port_forward.clone();
+        crate::nexus::native_port_forward_context(&target).map(|context| NexusRelayAdmission {
+            grant_id: context.grant_id,
+            session_id: context.session_id,
+            conn_type: conn_type.into(),
+            source_device_uid: context.source_device_uid,
+            publishing_device_uid: context.publishing_device_uid,
+            relay_node_id: context.relay_node_id,
+            expires_at: context.expires_at,
+            nonce: context.nonce,
+            admission_proof: context.admission_proof,
+            target_digest: context.target_digest,
+            key_id: context.key_id,
+            protocol_version: context.protocol_version,
+            ..Default::default()
+        })
+    }
+
     fn swap_modifier_mouse(&self, _msg: &mut hbb_common::protos::message::MouseEvent) {}
 
     fn update_direct(&self, direct: Option<bool>) {
@@ -3790,7 +3924,12 @@ pub trait Interface: Send + Clone + 'static + Sized {
             log::info!("Restart remote device, suppress connection error: {err}");
             // Flutter treats this as a reconnect control event. The text is kept
             // for legacy UI and existing translation reuse.
-            self.msgbox("restarting", "Restarting remote device", "Connection in progress. Please wait.", "");
+            self.msgbox(
+                "restarting",
+                "Restarting remote device",
+                "Connection in progress. Please wait.",
+                "",
+            );
             return;
         }
 
@@ -4242,11 +4381,16 @@ async fn test_udp_uat(
     mut stop_udp_rx: oneshot::Receiver<()>,
 ) -> ResultType<()> {
     let (tx, mut rx) = oneshot::channel::<_>();
-    tokio::spawn(async {
-        if let Ok(v) = crate::test_nat_ipv4().await {
-            tx.send(v).ok();
-        }
-    });
+    // The forced KCP harness must advertise the port of `udp_socket` itself.
+    // A public STUN probe intentionally uses a separate socket, so its mapped
+    // port cannot be sent to the peer for this native rendezvous punch.
+    if std::env::var("NEXUS_E2E_FORCE_KCP").as_deref() != Ok("1") {
+        tokio::spawn(async {
+            if let Ok(v) = crate::test_nat_ipv4().await {
+                tx.send(v).ok();
+            }
+        });
+    }
 
     let start = Instant::now();
     let mut msg_out = RendezvousMessage::new();

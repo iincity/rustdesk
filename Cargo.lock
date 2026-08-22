@@ -5092,23 +5092,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-tunnel-client"
-version = "0.1.0"
-source = "git+https://github.com/iincity/nexus-tunnel.git?rev=75bc36d0a5a27c2cb1cba9feaa8771806f7924ae#75bc36d0a5a27c2cb1cba9feaa8771806f7924ae"
-dependencies = [
- "nexus-tunnel-core",
-]
-
-[[package]]
-name = "nexus-tunnel-core"
-version = "0.1.0"
-source = "git+https://github.com/iincity/nexus-tunnel.git?rev=75bc36d0a5a27c2cb1cba9feaa8771806f7924ae#75bc36d0a5a27c2cb1cba9feaa8771806f7924ae"
-
-[[package]]
 name = "nexus_client"
 version = "0.1.0"
 dependencies = [
- "nexus-tunnel-client",
+ "aes-gcm",
+ "getrandom 0.2.15",
+ "hex",
+ "serde 1.0.228",
+ "serde_json 1.0.118",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

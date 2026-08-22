@@ -514,6 +514,7 @@ impl RendezvousMediator {
             false,
             Default::default(),
             meta,
+            rr.nexus_admission.into_option(),
         )
         .await
     }
@@ -528,6 +529,7 @@ impl RendezvousMediator {
         initiate: bool,
         socket_addr_v6: bytes::Bytes,
         meta: ConnectionMeta,
+        nexus_admission: Option<NexusRelayAdmission>,
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&socket_addr);
         log::info!(
@@ -545,6 +547,7 @@ impl RendezvousMediator {
             socket_addr: socket_addr.into(),
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
+            nexus_admission: nexus_admission.clone().into(),
             ..Default::default()
         };
         if initiate {
@@ -562,6 +565,7 @@ impl RendezvousMediator {
             secure,
             is_ipv4(&self.addr),
             meta,
+            nexus_admission,
         )
         .await;
         Ok(())
@@ -612,6 +616,7 @@ impl RendezvousMediator {
             true,
             socket_addr_v6,
             meta,
+            None,
         )
         .await
     }
@@ -648,6 +653,12 @@ impl RendezvousMediator {
     }
 
     async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
+        if std::env::var("NEXUS_E2E_FORCE_KCP").as_deref() == Ok("1") {
+            log::info!(
+                "NEXUS_E2E_FORCE_KCP: Host received PunchHole udp_port={}",
+                ph.udp_port
+            );
+        }
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
         let last = *LAST_MSG.lock().await;
         *LAST_MSG.lock().await = (peer_addr, Instant::now());
@@ -684,18 +695,23 @@ impl RendezvousMediator {
                     true,
                     socket_addr_v6.clone(),
                     meta,
+                    ph.nexus_admission.clone().into_option(),
                 )
                 .await;
         }
         use hbb_common::protobuf::Enum;
         let nat_type = NatType::from_i32(Config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
         let msg_punch = PunchHoleSent {
+            // Keep the Gateway's rendezvous TCP address in the control
+            // message. hbbs routes the readiness response through that
+            // existing TCP punch session; the response carries Host UDP.
             socket_addr: ph.socket_addr,
             id: Config::get_id(),
             relay_server,
             nat_type: nat_type.into(),
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
+            nexus_admission: ph.nexus_admission.clone(),
             ..Default::default()
         };
         if ph.udp_port > 0 {
@@ -811,15 +827,24 @@ impl RendezvousMediator {
             id,
             self.addr,
         );
-        let mut msg_out = Message::new();
         let serial = Config::get_serial();
+        let msg_out = Self::register_peer_message(id, serial);
+        socket.send(&msg_out).await?;
+        Ok(())
+    }
+
+    fn register_peer_message(id: String, serial: i32) -> Message {
+        let mut msg_out = Message::new();
+        #[cfg(feature = "nexus-native-tunnel")]
+        let nexus_registration = crate::nexus::native_registration_extension();
         msg_out.set_register_peer(RegisterPeer {
             id,
             serial,
+            #[cfg(feature = "nexus-native-tunnel")]
+            nexus_registration: nexus_registration.into(),
             ..Default::default()
         });
-        socket.send(&msg_out).await?;
-        Ok(())
+        msg_out
     }
 
     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
@@ -842,6 +867,27 @@ fn get_direct_port() -> i32 {
         port = RENDEZVOUS_PORT + 2;
     }
     port
+}
+
+#[cfg(all(test, feature = "nexus-native-tunnel"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_peer_message_keeps_native_identity_and_adds_nexus_extension() {
+        std::env::set_var("NEXUS_CONTROL_PLANE_URL", "https://control-plane.invalid");
+        std::env::set_var("NEXUS_RUSTDESK_REGISTRATION_TOKEN", "test-token");
+        let message = RendezvousMediator::register_peer_message("native-device".into(), 7);
+        let Some(rendezvous_message::Union::RegisterPeer(registration)) = message.union else {
+            panic!("register peer message");
+        };
+        assert_eq!(registration.id, "native-device");
+        assert_eq!(registration.serial, 7);
+        let extension = registration.nexus_registration.0.expect("Nexus extension");
+        assert_eq!(extension.protocol_version, 1);
+        assert_eq!(extension.capabilities.len(), 3);
+        assert_eq!(extension.capability_digest.len(), 64);
+    }
 }
 
 async fn direct_server(server: ServerPtr) {
@@ -899,6 +945,7 @@ async fn direct_server(server: ServerPtr) {
                             addr,
                             false,
                             ConnectionMeta::default(), // Direct connections don't have server-side user context.
+                            None,
                         )
                         .await
                     );
@@ -963,7 +1010,15 @@ async fn udp_nat_listen(
             res,
         )
         .await?;
-        crate::server::create_tcp_connection(server, stream.1, peer_addr_v4, true, meta).await?;
+        crate::server::create_tcp_connection(
+            server,
+            stream.1,
+            peer_addr_v4,
+            true,
+            meta,
+            Some(stream.0),
+        )
+        .await?;
         Ok(())
     };
     func.await.map_err(|e: anyhow::Error| {

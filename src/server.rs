@@ -31,6 +31,7 @@ use service::{EmptyExtraFieldService, GenericService, Service, Subscriber};
 use video_service::VideoSource;
 
 use crate::ipc::Data;
+use crate::kcp_stream::KcpStream;
 
 pub mod audio_service;
 #[cfg(target_os = "windows")]
@@ -189,6 +190,7 @@ async fn accept_connection_(
             addr,
             secure,
             meta,
+            None,
         )
         .await?;
     }
@@ -201,6 +203,8 @@ pub async fn create_tcp_connection(
     addr: SocketAddr,
     secure: bool,
     meta: ConnectionMeta,
+    // KCP owns its UDP I/O task and must outlive the server connection.
+    kcp: Option<KcpStream>,
 ) -> ResultType<()> {
     let mut stream = stream;
     let id = server.write().unwrap().get_new_id();
@@ -268,7 +272,7 @@ pub async fn create_tcp_connection(
         }
         log::info!("wake up macos");
     }
-    Connection::start(addr, stream, id, Arc::downgrade(&server), meta).await;
+    Connection::start(addr, stream, id, Arc::downgrade(&server), meta, kcp).await;
     Ok(())
 }
 
@@ -292,6 +296,7 @@ pub async fn create_relay_connection(
     secure: bool,
     ipv4: bool,
     meta: ConnectionMeta,
+    nexus_admission: Option<NexusRelayAdmission>,
 ) {
     if let Err(err) = create_relay_connection_(
         server,
@@ -301,6 +306,7 @@ pub async fn create_relay_connection(
         secure,
         ipv4,
         meta,
+        nexus_admission,
     )
     .await
     {
@@ -321,6 +327,7 @@ async fn create_relay_connection_(
     secure: bool,
     ipv4: bool,
     meta: ConnectionMeta,
+    nexus_admission: Option<NexusRelayAdmission>,
 ) -> ResultType<()> {
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
@@ -332,10 +339,15 @@ async fn create_relay_connection_(
     msg_out.set_request_relay(RequestRelay {
         licence_key,
         uuid,
+        conn_type: nexus_admission
+            .as_ref()
+            .map(|admission| admission.conn_type)
+            .unwrap_or_default(),
+        nexus_admission: nexus_admission.into(),
         ..Default::default()
     });
     stream.send(&msg_out).await?;
-    create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
+    create_tcp_connection(server, stream, peer_addr, secure, meta, None).await?;
     Ok(())
 }
 
@@ -598,6 +610,16 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                 .map(|path| path.to_path_buf())
                 .unwrap_or_else(Config::get_home),
         );
+        #[cfg(feature = "nexus")]
+        match crate::nexus::TunnelHostConfig::from_rustdesk_config()
+            .and_then(crate::nexus::start_host_service)
+        {
+            Ok(()) => log::info!("Nexus Tunnel host service started"),
+            // Nexus is optional to the upstream remote-desktop service. An
+            // incomplete deployment configuration must fail closed instead of
+            // guessing identities or authenticated network endpoints.
+            Err(error) => log::warn!("Nexus Tunnel host service disabled: {error}"),
+        }
         crate::common::set_server_running(true);
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {

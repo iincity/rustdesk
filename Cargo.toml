@@ -20,6 +20,21 @@ path = "src/naming.rs"
 name = "service"
 path = "src/service.rs"
 
+[[bin]]
+name = "nexus-gateway"
+path = "src/bin/nexus_gateway.rs"
+required-features = ["nexus-gateway"]
+
+[[bin]]
+name = "nexus-e2e-host"
+path = "src/bin/nexus_e2e_host.rs"
+required-features = ["nexus-e2e-host"]
+
+[[bin]]
+name = "nexus-e2e-gateway"
+path = "src/bin/nexus_e2e_gateway.rs"
+required-features = ["nexus-e2e-gateway"]
+
 [features]
 inline = []
 use_samplerate = ["samplerate"]
@@ -48,6 +63,16 @@ unix-file-copy-paste = [
 ]
 screencapturekit = ["cpal/screencapturekit"]
 nexus = ["dep:nexus_client"]
+nexus-agent = ["nexus"]
+nexus-native-tunnel = ["nexus"]
+nexus-gateway = ["nexus-native-tunnel"]
+nexus-e2e-host = ["nexus-native-tunnel", "nexus-agent"]
+# This intentionally remains a separate test binary: production Gateway
+# refreshes accept HTTPS only, while the local process harness owns loopback HTTP.
+nexus-e2e-gateway = ["nexus-native-tunnel"]
+# Reserved solely so obsolete callers fail at compile time instead of silently
+# restoring the retired FRP runtime. Native production never enables it.
+nexus-frp-compat-smoke = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -89,7 +114,6 @@ totp-rs = { version = "5.4", default-features = false, features = ["gen_secret",
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys"}
 reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd"], default-features=false }
-
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
 cpal = { git = "https://github.com/rustdesk-org/cpal", branch = "osx-screencapturekit" }

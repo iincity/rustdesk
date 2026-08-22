@@ -39,9 +39,12 @@ use hbb_common::{
     futures::{SinkExt, StreamExt},
     get_time, get_version_number,
     message_proto::{option_message::BoolOption, permission_info::Permission},
+    nexus_wire::canonical_port_forward_admission,
     password_security::{self as password, ApproveMode},
     sha2::{Digest, Sha256},
-    sleep, timeout,
+    sleep,
+    sodiumoxide::crypto::sign,
+    timeout,
     tokio::{
         net::TcpStream,
         sync::mpsc,
@@ -87,6 +90,11 @@ lazy_static::lazy_static! {
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     pub static ref AUTHED_CONNS: Arc::<Mutex<Vec<AuthedConn>>> = Default::default();
     pub static ref CONTROL_PERMISSIONS_ARRAY: Arc::<Mutex<Vec<(i32, ControlPermissions)>>> = Default::default();
+    static ref NEXUS_PORT_FORWARD_NONCES: Arc::<Mutex<HashSet<Vec<u8>>>> = Default::default();
+    // Serialize connection-manager discovery/spawn. Multiple native sessions can
+    // authenticate concurrently; without this guard they all observe a missing
+    // `_cm` socket and race to create the same Unix IPC endpoint.
+    static ref CM_START_LOCK: Arc<tokio::sync::Mutex<()>> = Default::default();
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
 }
@@ -268,6 +276,7 @@ enum ConnAuditPrimaryAuth {
     TemporaryPassword = 2,
     PermanentPassword = 3,
     SwitchSides = 4,
+    NexusGrant = 5,
 }
 
 impl ConnAuditPrimaryAuth {
@@ -312,6 +321,9 @@ pub struct Connection {
     inner: ConnInner,
     display_idx: usize,
     stream: super::Stream,
+    // KCP's UDP I/O task is owned by this guard. Keeping it on the connection
+    // prevents a raw PortForward stream from losing its transport mid-session.
+    _kcp: Option<crate::kcp_stream::KcpStream>,
     server: super::ServerPtrWeak,
     hash: Hash,
     read_jobs: Vec<fs::TransferJob>,
@@ -464,6 +476,7 @@ impl Connection {
         id: i32,
         server: super::ServerPtrWeak,
         meta: super::ConnectionMeta,
+        kcp: Option<crate::kcp_stream::KcpStream>,
     ) {
         let super::ConnectionMeta {
             control_permissions,
@@ -517,6 +530,7 @@ impl Connection {
             // with the primary index returned with the refreshed display snapshot.
             display_idx: 0,
             stream,
+            _kcp: kcp,
             server,
             hash,
             read_jobs: Vec::new(),
@@ -1304,14 +1318,28 @@ impl Connection {
                     res = forward.next() => {
                         if let Some(res) = res {
                             last_recv_time = Instant::now();
+                            if std::env::var("NEXUS_E2E_TRACE_PORT_FORWARD").as_deref() == Ok("1") {
+                                log::info!("NEXUS_E2E_TRACE_PORT_FORWARD: target -> gateway {} bytes", res.as_ref().map(|bytes| bytes.len()).unwrap_or(0));
+                            }
                             self.stream.send_bytes(res?.into()).await?;
                         } else {
-                            bail!("Forward reset by the peer");
+                            // KCP writes are queued on its UDP task. When a private
+                            // TCP service closes immediately after its final bytes
+                            // (notably a TLS handshake response), retain that task
+                            // for one short transport turn before closing the raw
+                            // RustDesk session.
+                            if self._kcp.is_some() {
+                                time::sleep(Duration::from_millis(250)).await;
+                            }
+                            break;
                         }
                     },
                     res = self.stream.next() => {
                         if let Some(res) = res {
                             last_recv_time = Instant::now();
+                            if std::env::var("NEXUS_E2E_TRACE_PORT_FORWARD").as_deref() == Ok("1") {
+                                log::info!("NEXUS_E2E_TRACE_PORT_FORWARD: gateway -> target {} bytes", res.as_ref().map(|bytes| bytes.len()).unwrap_or(0));
+                            }
                             timeout(SEND_TIMEOUT_OTHER, forward.send(res?)).await??;
                         } else {
                             bail!("Stream reset by the peer");
@@ -1734,6 +1762,91 @@ impl Connection {
             pf.host = "localhost".to_owned();
         }
         (format!("{}:{}", pf.host, pf.port), is_rdp)
+    }
+
+    fn validate_nexus_port_forward_context(pf: &PortForward, addr: &str) -> bool {
+        let Some(context) = pf.nexus_context.as_ref() else {
+            return true;
+        };
+        if context.protocol_version != 1
+            || context.grant_id.trim().is_empty()
+            || context.session_id.trim().is_empty()
+            || context.admission_proof.is_empty()
+            || context.nonce.is_empty()
+            || context.expires_at <= get_time()
+        {
+            return false;
+        }
+        let digest = Sha256::digest(format!("nexus-port-forward-target-v1\0{addr}").as_bytes());
+        if !context
+            .target_digest
+            .eq_ignore_ascii_case(&hex::encode(digest))
+        {
+            return false;
+        }
+        if !context.key_id.trim().is_empty() && !Self::verify_nexus_port_forward_signature(context)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// A Nexus context is checked before the normal login branch selects the
+    /// PortForward target, but its nonce is consumed only when that branch
+    /// actually authorizes the connection. This prevents a rejected password
+    /// or 2FA attempt from burning a one-shot grant.
+    fn consume_nexus_port_forward_context(
+        context: &hbb_common::message_proto::NexusPortForwardContext,
+    ) -> bool {
+        NEXUS_PORT_FORWARD_NONCES
+            .lock()
+            .map(|mut seen| seen.insert(context.nonce.to_vec()))
+            .unwrap_or(false)
+    }
+
+    fn consume_nexus_port_forward_grant(&self) -> bool {
+        let Some(login_request::Union::PortForward(mut forward)) = self.lr.union.clone() else {
+            return false;
+        };
+        let Some(context) = forward.nexus_context.as_ref().cloned() else {
+            return false;
+        };
+        let (addr, _) = Self::normalize_port_forward_target(&mut forward);
+        Self::validate_nexus_port_forward_context(&forward, &addr)
+            && Self::consume_nexus_port_forward_context(&context)
+    }
+
+    fn verify_nexus_port_forward_signature(
+        context: &hbb_common::message_proto::NexusPortForwardContext,
+    ) -> bool {
+        let Some(expected_key_id) = std::env::var_os("NEXUS_TUNNEL_SIGNING_KEY_ID") else {
+            return false;
+        };
+        if context.key_id != expected_key_id.to_string_lossy()
+            || context.source_device_uid.trim().is_empty()
+            || context.publishing_device_uid.trim().is_empty()
+            || context.relay_node_id.trim().is_empty()
+        {
+            return false;
+        }
+        let Ok(public_key_bytes) = std::env::var("NEXUS_TUNNEL_SIGNING_PUBLIC_KEY_HEX")
+            .ok()
+            .and_then(|value| hex::decode(value).ok())
+            .ok_or(())
+        else {
+            return false;
+        };
+        let Some(public_key) = sign::PublicKey::from_slice(&public_key_bytes) else {
+            return false;
+        };
+        let Ok(signature) = sign::Signature::from_bytes(&context.admission_proof) else {
+            return false;
+        };
+        sign::verify_detached(
+            &signature,
+            &canonical_port_forward_admission(context),
+            &public_key,
+        )
     }
 
     async fn connect_port_forward_if_needed(&mut self) -> bool {
@@ -2757,6 +2870,12 @@ impl Connection {
                         return false;
                     }
                     let (addr, _is_rdp) = Self::normalize_port_forward_target(&mut pf);
+                    if !Self::validate_nexus_port_forward_context(&pf, &addr) {
+                        self.send_login_error("Invalid or expired Nexus tunnel grant")
+                            .await;
+                        sleep(1.).await;
+                        return false;
+                    }
                     self.port_forward_address = addr;
                 }
                 _ => {
@@ -2852,8 +2971,22 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
-                || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
+            let nexus_port_forward_grant = self.consume_nexus_port_forward_grant();
+            let has_nexus_port_forward_context = matches!(
+                self.lr.union.as_ref(),
+                Some(login_request::Union::PortForward(forward)) if forward.nexus_context.is_some()
+            );
+            if has_nexus_port_forward_context && !nexus_port_forward_grant {
+                self.send_login_error("Invalid or expired Nexus tunnel grant")
+                    .await;
+                return false;
+            }
+
+            if !nexus_port_forward_grant
+                && ((password::approve_mode() == ApproveMode::Click
+                    && !allow_logon_screen_password)
+                    || password::approve_mode() == ApproveMode::Both
+                        && !password::has_valid_password())
             {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
@@ -2870,7 +3003,14 @@ impl Connection {
                         .await;
                 }
                 return true;
-            } else if self.is_recent_session(false) {
+            } else if nexus_port_forward_grant || self.is_recent_session(false) {
+                if nexus_port_forward_grant {
+                    // A signed, one-shot Tunnel grant is the credential for this
+                    // PORT_FORWARD session. It intentionally never transports the
+                    // Host's Remote password or 2FA secret through the Gateway.
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::NexusGrant);
+                    self.require_2fa.take();
+                }
                 if err_msg.is_empty() {
                     #[cfg(target_os = "linux")]
                     self.linux_headless_handle.wait_desktop_cm_ready().await;
@@ -6091,6 +6231,10 @@ async fn start_ipc(
         && linux_desktop_manager::is_headless();
     #[cfg(not(target_os = "linux"))]
     let headless_cm = false;
+    // Only one authenticated session may create the per-user CM process. The
+    // resulting socket accepts multiple client streams, so holding this lock
+    // during discovery/spawn removes the startup race without serializing data.
+    let _cm_start_guard = CM_START_LOCK.lock().await;
     let mut stream = None;
     if !headless_cm {
         if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
@@ -6225,6 +6369,7 @@ async fn start_ipc(
         bail!("Failed to connect to connection manager");
     }
 
+    drop(_cm_start_guard);
     let _res = tx_stream_ready.send(()).await;
     let mut stream = stream.ok_or(anyhow!("none stream"))?;
     loop {
@@ -7520,5 +7665,95 @@ mod test {
             scoped.terminal_persistent.enum_value(),
             Ok(BoolOption::NotSet)
         );
+    }
+
+    #[test]
+    fn nexus_port_forward_context_binds_the_legacy_target_and_expires() {
+        let addr = "127.0.0.1:8080";
+        let digest = hex::encode(Sha256::digest(
+            format!("nexus-port-forward-target-v1\0{addr}").as_bytes(),
+        ));
+        let context = NexusPortForwardContext {
+            grant_id: "grant-1".into(),
+            session_id: "session-1".into(),
+            admission_proof: vec![1].into(),
+            target_digest: digest,
+            protocol_version: 1,
+            expires_at: get_time() + 1_000,
+            nonce: vec![7].into(),
+            ..Default::default()
+        };
+        let forward = PortForward {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            nexus_context: Some(context).into(),
+            ..Default::default()
+        };
+        assert!(Connection::validate_nexus_port_forward_context(
+            &forward, addr
+        ));
+        assert!(Connection::validate_nexus_port_forward_context(
+            &forward, addr
+        ));
+        assert!(Connection::consume_nexus_port_forward_context(
+            forward.nexus_context.as_ref().unwrap()
+        ));
+        assert!(!Connection::consume_nexus_port_forward_context(
+            forward.nexus_context.as_ref().unwrap()
+        ));
+
+        let mut invalid = forward.clone();
+        invalid.nexus_context.as_mut().unwrap().expires_at = get_time() - 1;
+        assert!(!Connection::validate_nexus_port_forward_context(
+            &invalid, addr
+        ));
+        assert!(Connection::validate_nexus_port_forward_context(
+            &PortForward::default(),
+            addr
+        ));
+    }
+
+    #[test]
+    fn signed_nexus_port_forward_context_rejects_tampering() {
+        let (public_key, secret_key) = sign::gen_keypair();
+        std::env::set_var("NEXUS_TUNNEL_SIGNING_KEY_ID", "test-key");
+        std::env::set_var(
+            "NEXUS_TUNNEL_SIGNING_PUBLIC_KEY_HEX",
+            hex::encode(public_key.as_ref()),
+        );
+        let addr = "127.0.0.1:8083";
+        let mut context = NexusPortForwardContext {
+            grant_id: "grant-signed".into(),
+            session_id: "session-signed".into(),
+            target_digest: hex::encode(Sha256::digest(
+                format!("nexus-port-forward-target-v1\0{addr}").as_bytes(),
+            )),
+            protocol_version: 1,
+            expires_at: get_time() + 1_000,
+            nonce: vec![8, 9].into(),
+            key_id: "test-key".into(),
+            source_device_uid: "source".into(),
+            publishing_device_uid: "publishing".into(),
+            relay_node_id: "relay".into(),
+            ..Default::default()
+        };
+        context.admission_proof =
+            sign::sign_detached(&canonical_port_forward_admission(&context), &secret_key)
+                .to_bytes()
+                .to_vec()
+                .into();
+        let forward = PortForward {
+            host: "127.0.0.1".into(),
+            port: 8083,
+            nexus_context: Some(context.clone()).into(),
+            ..Default::default()
+        };
+        assert!(Connection::validate_nexus_port_forward_context(
+            &forward, addr
+        ));
+        context.target_digest.push('0');
+        assert!(!Connection::verify_nexus_port_forward_signature(&context));
+        std::env::remove_var("NEXUS_TUNNEL_SIGNING_KEY_ID");
+        std::env::remove_var("NEXUS_TUNNEL_SIGNING_PUBLIC_KEY_HEX");
     }
 }
