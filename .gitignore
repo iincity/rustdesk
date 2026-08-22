@@ -1,5 +1,6 @@
 /build
 /target
+/target-nexus-frp-*/
 .vscode
 .idea
 .DS_Store
