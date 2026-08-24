@@ -11,7 +11,7 @@ pub enum LocalAccessProtocol {
 
 /// A signed local listener with a finite target allow-list.
 ///
-/// This is intentionally separate from FRP plugins: it describes the Nexus
+/// This is intentionally separate from legacy proxy plugins: it describes the Nexus
 /// access decision rather than forwarding arbitrary plugin configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalAccessListener {

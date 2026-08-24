@@ -1,4 +1,3 @@
-#[path = "native_presence_impl.rs"]
-mod presence_udp;
+//! Compatibility shim for the pre-layered module path.
 
-pub use presence_udp::{PresenceClient, PresenceClientError};
+pub use crate::transport::{PresenceClient, PresenceClientError};

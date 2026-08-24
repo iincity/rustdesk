@@ -38,7 +38,7 @@ fn main() {
             eprintln!("NEXUS_E2E_RENDEZVOUS_SERVER is required");
             std::process::exit(2);
         });
-    hbb_common::config::Config::set_option("custom-rendezvous-server".into(), rendezvous);
+    hbb_common::config::Config::set_option("custom-rendezvous-server".into(), rendezvous.clone());
     // KCP coverage deliberately disables only the direct TCP listener; the
     // existing rendezvous UDP/KCP path remains unchanged and must carry the
     // PortForward session on its own.
@@ -50,6 +50,11 @@ fn main() {
     hbb_common::config::Config::set_option("direct-server".into(), direct_server.into());
     if let Ok(key) = std::env::var("NEXUS_E2E_RENDEZVOUS_KEY") {
         hbb_common::config::Config::set_option("key".into(), key);
+        // The native mediator requires both global and per-host confirmation
+        // before it emits RegisterPeer (which carries the Nexus extension).
+        // This test-only Host receives the local hbbs key explicitly from the
+        // harness, so it can establish that trust without a UI round trip.
+        hbb_common::config::Config::set_host_key_confirmed(&rendezvous, true);
     }
     hbb_common::config::Config::set_key_confirmed(true);
     if let Ok(password) = std::env::var("NEXUS_E2E_LEGACY_PASSWORD") {

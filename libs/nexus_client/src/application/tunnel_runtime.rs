@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nexus_tunnel_core::{
+use crate::{
     ApplyError, CompiledTunnelConfig, ConfigCompileError, ConfigNotice, Transition,
     TunnelDataPlaneAssignment, TunnelDesiredState, TunnelMachine, TunnelState, TunnelStatus,
 };
@@ -27,7 +27,7 @@ impl TunnelRuntime {
         self.machine.desired_state()
     }
     /// Returns the generation token required when an asynchronous data-plane task completes.
-    pub fn generation(&self) -> Option<nexus_tunnel_core::ConfigGeneration> {
+    pub fn generation(&self) -> Option<crate::ConfigGeneration> {
         self.machine.generation()
     }
     pub fn metrics(&self) -> &TunnelMetrics {
@@ -80,7 +80,7 @@ impl TunnelRuntime {
     }
     pub fn on_activation_succeeded(
         &mut self,
-        generation: nexus_tunnel_core::ConfigGeneration,
+        generation: crate::ConfigGeneration,
     ) -> Result<Transition, ApplyError> {
         let result = self.machine.on_activation_succeeded(generation);
         if result.is_ok() {
@@ -98,7 +98,7 @@ impl TunnelRuntime {
     }
     pub fn on_activation_failed(
         &mut self,
-        generation: nexus_tunnel_core::ConfigGeneration,
+        generation: crate::ConfigGeneration,
     ) -> Result<Transition, ApplyError> {
         self.metrics.activation_started_at = None;
         self.metrics.errors += 1;
@@ -106,13 +106,13 @@ impl TunnelRuntime {
     }
     pub fn on_drain_complete(
         &mut self,
-        generation: nexus_tunnel_core::ConfigGeneration,
+        generation: crate::ConfigGeneration,
     ) -> Result<Transition, ApplyError> {
         self.machine.on_drain_complete(generation)
     }
     pub fn on_retry_ready(
         &mut self,
-        generation: nexus_tunnel_core::ConfigGeneration,
+        generation: crate::ConfigGeneration,
     ) -> Result<Transition, ApplyError> {
         self.machine.on_retry_ready(generation, now_secs())
     }
@@ -122,8 +122,8 @@ impl TunnelRuntime {
             self.metrics.presence_heartbeats_succeeded += 1;
         }
     }
-    pub fn record_frp_reconnect(&mut self) {
-        self.metrics.frp_reconnects += 1;
+    pub fn record_transport_reconnect(&mut self) {
+        self.metrics.transport_reconnects += 1;
     }
     pub fn record_connection_opened(&mut self) {
         self.metrics.active_connections += 1;
@@ -155,7 +155,7 @@ pub struct TunnelMetrics {
     pub desired_state_rejected: u64,
     pub activation_count: u64,
     pub activation_time_secs_total: u64,
-    pub frp_reconnects: u64,
+    pub transport_reconnects: u64,
     pub active_connections: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -173,9 +173,7 @@ pub enum TunnelRuntimeConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_tunnel_core::{
-        RelayAssignment, TransportProtocol, TunnelPolicy, TunnelRoute, TunnelService,
-    };
+    use crate::{RelayAssignment, TransportProtocol, TunnelPolicy, TunnelRoute, TunnelService};
 
     fn active() -> TunnelDesiredState {
         TunnelDesiredState::active(
@@ -209,7 +207,6 @@ mod tests {
             remote_ports: vec![("edge://tenant-a/ssh".into(), 10_022)],
         }
     }
-
     #[test]
     fn runtime_reuses_core_state_machine() {
         let mut runtime = TunnelRuntime::new();
@@ -244,7 +241,7 @@ mod tests {
         );
         assert_eq!(
             runtime.status().desired_version,
-            Some(nexus_tunnel_core::ConfigVersion(8))
+            Some(crate::ConfigVersion(8))
         );
     }
     #[test]
@@ -255,14 +252,14 @@ mod tests {
         runtime.record_connection_opened();
         runtime.record_bytes(12, 34);
         runtime.record_connection_closed();
-        runtime.record_frp_reconnect();
+        runtime.record_transport_reconnect();
         runtime.record_error();
         assert_eq!(runtime.metrics().presence_heartbeats, 2);
         assert_eq!(runtime.metrics().presence_heartbeats_succeeded, 1);
         assert_eq!(runtime.metrics().active_connections, 0);
         assert_eq!(runtime.metrics().bytes_sent, 12);
         assert_eq!(runtime.metrics().bytes_received, 34);
-        assert_eq!(runtime.metrics().frp_reconnects, 1);
+        assert_eq!(runtime.metrics().transport_reconnects, 1);
         assert_eq!(runtime.metrics().errors, 1);
     }
 }

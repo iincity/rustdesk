@@ -29,7 +29,7 @@ pub enum TransportProtocol {
     /// NAT-traversed protected proxy; requires signed `ProtectedAccess`.
     Xtcp,
     /// HTTP virtual-host proxy; the route's remote address is the assigned
-    /// control-plane host name and is never treated as raw FRP configuration.
+    /// control-plane host name and is never treated as raw upstream configuration.
     Http,
     /// HTTPS virtual-host proxy with the same controlled host mapping.
     Https,
@@ -37,7 +37,7 @@ pub enum TransportProtocol {
     TcpMux,
 }
 
-/// Control-plane-authorized access material for protected FRP services.
+/// Control-plane-authorized access material for protected Relay services.
 ///
 /// This value is signed with the Desired State and is deliberately narrower
 /// than upstream configuration: callers cannot inject listeners or plugins.
@@ -63,7 +63,7 @@ pub struct TunnelService {
 
 /// A signed, deliberately narrow static-file backend for one TCP service.
 ///
-/// It is not raw FRP plugin TOML: paths must be absolute, cannot traverse a
+/// It is not raw plugin configuration: paths must be absolute, cannot traverse a
 /// parent directory, and the plugin is bound to an existing signed service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaticFilePlugin {
@@ -80,7 +80,7 @@ pub struct UnixSocketPlugin {
 }
 
 /// Signed HTTP or SOCKS5 forward-proxy backend for one plain TCP service.
-/// Credentials are optional as a pair and are never accepted as raw plugin TOML.
+/// Credentials are optional as a pair and are never accepted as raw plugin configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForwardProxyPlugin {
     pub service_id: String,
@@ -154,7 +154,7 @@ pub struct TunnelDesiredState {
     pub policy: TunnelPolicy,
     /// Signed protected-service access listeners, separate from publishing services.
     pub visitors: Vec<TunnelVisitor>,
-    /// Signed loopback-only support listeners, never raw FRP plugins.
+    /// Signed loopback-only support listeners, never raw upstream plugins.
     pub local_access_listeners: Vec<LocalAccessListener>,
     /// Signed whitelist of the only upstream plugin currently admitted.
     pub static_file_plugins: Vec<StaticFilePlugin>,

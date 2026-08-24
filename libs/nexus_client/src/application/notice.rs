@@ -1,6 +1,6 @@
 //! Pure Config Notice refresh decision.
 
-use nexus_tunnel_core::{ConfigNotice, TunnelStatus};
+use crate::{ConfigNotice, TunnelStatus};
 
 /// Returns whether an unauthenticated notice warrants fetching signed Desired State.
 pub fn should_refresh_from_notice(status: &TunnelStatus, notice: ConfigNotice) -> bool {
@@ -14,7 +14,7 @@ pub fn should_refresh_from_notice(status: &TunnelStatus, notice: ConfigNotice) -
 
 #[cfg(test)]
 mod tests {
-    use nexus_tunnel_core::{ConfigDigest, ConfigNotice, ConfigVersion, TunnelState, TunnelStatus};
+    use crate::{ConfigDigest, ConfigNotice, ConfigVersion, TunnelState, TunnelStatus};
 
     use super::should_refresh_from_notice;
 

@@ -3891,6 +3891,8 @@ pub trait Interface: Send + Clone + 'static + Sized {
             conn_type: conn_type.into(),
             source_device_uid: context.source_device_uid,
             publishing_device_uid: context.publishing_device_uid,
+            tenant_ref: context.tenant_ref,
+            relay_pool_id: context.relay_pool_id,
             relay_node_id: context.relay_node_id,
             expires_at: context.expires_at,
             nonce: context.nonce,

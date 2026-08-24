@@ -1768,9 +1768,12 @@ impl Connection {
         let Some(context) = pf.nexus_context.as_ref() else {
             return true;
         };
-        if context.protocol_version != 1
+        if context.protocol_version != 2
             || context.grant_id.trim().is_empty()
             || context.session_id.trim().is_empty()
+            || context.key_id.trim().is_empty()
+            || context.tenant_ref.trim().is_empty()
+            || context.relay_pool_id.trim().is_empty()
             || context.admission_proof.is_empty()
             || context.nonce.is_empty()
             || context.expires_at <= get_time()
@@ -1784,8 +1787,7 @@ impl Connection {
         {
             return false;
         }
-        if !context.key_id.trim().is_empty() && !Self::verify_nexus_port_forward_signature(context)
-        {
+        if !Self::verify_nexus_port_forward_signature(context) {
             return false;
         }
         true
@@ -7668,7 +7670,7 @@ mod test {
     }
 
     #[test]
-    fn nexus_port_forward_context_binds_the_legacy_target_and_expires() {
+    fn nexus_port_forward_context_requires_signed_admission_and_binds_target() {
         let addr = "127.0.0.1:8080";
         let digest = hex::encode(Sha256::digest(
             format!("nexus-port-forward-target-v1\0{addr}").as_bytes(),
@@ -7678,9 +7680,11 @@ mod test {
             session_id: "session-1".into(),
             admission_proof: vec![1].into(),
             target_digest: digest,
-            protocol_version: 1,
+            protocol_version: 2,
             expires_at: get_time() + 1_000,
             nonce: vec![7].into(),
+            tenant_ref: "tenant".into(),
+            relay_pool_id: "relay".into(),
             ..Default::default()
         };
         let forward = PortForward {
@@ -7689,10 +7693,7 @@ mod test {
             nexus_context: Some(context).into(),
             ..Default::default()
         };
-        assert!(Connection::validate_nexus_port_forward_context(
-            &forward, addr
-        ));
-        assert!(Connection::validate_nexus_port_forward_context(
+        assert!(!Connection::validate_nexus_port_forward_context(
             &forward, addr
         ));
         assert!(Connection::consume_nexus_port_forward_context(
@@ -7700,12 +7701,6 @@ mod test {
         ));
         assert!(!Connection::consume_nexus_port_forward_context(
             forward.nexus_context.as_ref().unwrap()
-        ));
-
-        let mut invalid = forward.clone();
-        invalid.nexus_context.as_mut().unwrap().expires_at = get_time() - 1;
-        assert!(!Connection::validate_nexus_port_forward_context(
-            &invalid, addr
         ));
         assert!(Connection::validate_nexus_port_forward_context(
             &PortForward::default(),
@@ -7728,12 +7723,14 @@ mod test {
             target_digest: hex::encode(Sha256::digest(
                 format!("nexus-port-forward-target-v1\0{addr}").as_bytes(),
             )),
-            protocol_version: 1,
+            protocol_version: 2,
             expires_at: get_time() + 1_000,
             nonce: vec![8, 9].into(),
             key_id: "test-key".into(),
             source_device_uid: "source".into(),
             publishing_device_uid: "publishing".into(),
+            tenant_ref: "tenant".into(),
+            relay_pool_id: "relay".into(),
             relay_node_id: "relay".into(),
             ..Default::default()
         };
@@ -7751,9 +7748,28 @@ mod test {
         assert!(Connection::validate_nexus_port_forward_context(
             &forward, addr
         ));
+        let mut expired = forward.clone();
+        expired.nexus_context.as_mut().unwrap().expires_at = get_time() - 1;
+        assert!(!Connection::validate_nexus_port_forward_context(
+            &expired, addr
+        ));
+        let mut missing_signature = forward.clone();
+        missing_signature
+            .nexus_context
+            .as_mut()
+            .unwrap()
+            .admission_proof
+            .clear();
+        assert!(!Connection::validate_nexus_port_forward_context(
+            &missing_signature,
+            addr
+        ));
         context.target_digest.push('0');
         assert!(!Connection::verify_nexus_port_forward_signature(&context));
         std::env::remove_var("NEXUS_TUNNEL_SIGNING_KEY_ID");
         std::env::remove_var("NEXUS_TUNNEL_SIGNING_PUBLIC_KEY_HEX");
+        assert!(!Connection::validate_nexus_port_forward_context(
+            &forward, addr
+        ));
     }
 }

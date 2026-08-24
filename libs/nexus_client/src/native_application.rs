@@ -1,7 +1,5 @@
-#[path = "native_application/notice.rs"]
-mod notice;
-#[path = "native_application/runtime.rs"]
-mod runtime;
+//! Compatibility shim for the pre-layered module path.
 
-pub use notice::should_refresh_from_notice;
-pub use runtime::{TunnelMetrics, TunnelRuntime, TunnelRuntimeConfigError};
+pub use crate::application::{
+    should_refresh_from_notice, TunnelMetrics, TunnelRuntime, TunnelRuntimeConfigError,
+};

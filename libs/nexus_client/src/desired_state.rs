@@ -20,6 +20,16 @@ use crate::tunnel::{
 pub struct VerifiedDesiredState {
     pub desired_state: TunnelDesiredState,
     pub data_plane_assignment: Option<TunnelDataPlaneAssignment>,
+    /// Opaque revoked capability IDs that the RustDesk adapter must remove
+    /// before accepting another Nexus PortForward session.
+    pub revocation: Option<DesiredStateRevocation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesiredStateRevocation {
+    pub version: u64,
+    pub revoked_grant_ids: Vec<String>,
+    pub revoked_session_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +69,12 @@ struct DesiredStateWire {
     expires_at: i64,
     #[serde(default)]
     rollback_of_version: Option<u64>,
+    #[serde(default)]
+    revocation_version: u64,
+    #[serde(default)]
+    revoked_grant_ids: Vec<String>,
+    #[serde(default)]
+    revoked_session_ids: Vec<String>,
     signature_hex: String,
     /// Issuance metadata emitted alongside the signed envelope. Validity is
     /// governed by `not_before`/`expires_at`, so the host does not apply it.
@@ -74,7 +90,7 @@ struct DesiredStateWire {
     visitors: Vec<TunnelVisitorWire>,
     #[serde(default)]
     local_access_listeners: Vec<LocalAccessListenerWire>,
-    /// The only admitted upstream plugin model. Raw FRP plugin options remain
+    /// The only admitted upstream plugin model. Raw plugin options remain
     /// rejected at this network boundary.
     #[serde(default)]
     static_file_plugins: Vec<StaticFilePluginWire>,
@@ -128,7 +144,7 @@ struct TunnelVisitorWire {
     secret: String,
     bind: std::net::SocketAddr,
     max_connections: u16,
-    /// Opaque control-plane capability; never serialized into FRP options.
+    /// Opaque control-plane capability; never serialized into transport options.
     #[serde(default)]
     grant_id: Option<String>,
 }
@@ -335,19 +351,47 @@ pub fn parse_and_verify_desired_state(
     }
     let desired_state = wire.to_desired_state()?;
     let data_plane_assignment = wire.to_assignment();
+    let revocation = wire.to_revocation()?;
     // An Active state without its signed Relay assignment could only leave the
     // host in Activating indefinitely. Reject it before it reaches the
-    // lifecycle runtime rather than guessing a Relay or accepting raw FRP.
+    // lifecycle runtime rather than guessing a Relay or accepting raw options.
     if desired_state.mode == TunnelMode::Active && data_plane_assignment.is_none() {
         return Err(DesiredStateError::InvalidState);
     }
     Ok(VerifiedDesiredState {
         desired_state,
         data_plane_assignment,
+        revocation,
     })
 }
 
 impl DesiredStateWire {
+    fn to_revocation(&self) -> Result<Option<DesiredStateRevocation>, DesiredStateError> {
+        let present = self.revocation_version != 0
+            || !self.revoked_grant_ids.is_empty()
+            || !self.revoked_session_ids.is_empty();
+        if !present {
+            return Ok(None);
+        }
+        if self.revocation_version == 0 {
+            return Err(DesiredStateError::InvalidState);
+        }
+        let mut revoked_grant_ids = self.revoked_grant_ids.clone();
+        let mut revoked_session_ids = self.revoked_session_ids.clone();
+        for values in [&mut revoked_grant_ids, &mut revoked_session_ids] {
+            values.sort();
+            values.dedup();
+            if values.iter().any(|id| !valid_revocation_id(id)) {
+                return Err(DesiredStateError::InvalidState);
+            }
+        }
+        Ok(Some(DesiredStateRevocation {
+            version: self.revocation_version,
+            revoked_grant_ids,
+            revoked_session_ids,
+        }))
+    }
+
     fn to_desired_state(&self) -> Result<TunnelDesiredState, DesiredStateError> {
         let desired_state = TunnelDesiredState {
             version: ConfigVersion(self.version),
@@ -588,6 +632,15 @@ impl DesiredStateWire {
                 }
             }
         }
+        if self.revocation_version != 0
+            || !self.revoked_grant_ids.is_empty()
+            || !self.revoked_session_ids.is_empty()
+        {
+            hasher.update([1]);
+            hasher.update(self.revocation_version.to_le_bytes());
+            hash_string_list(&mut hasher, &self.revoked_grant_ids);
+            hash_string_list(&mut hasher, &self.revoked_session_ids);
+        }
         hasher.finalize().to_vec()
     }
 }
@@ -604,6 +657,17 @@ fn hash_option_string(hasher: &mut Sha256, value: Option<&str>) {
     } else {
         hasher.update([0]);
     }
+}
+
+fn hash_string_list(hasher: &mut Sha256, values: &[String]) {
+    hasher.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        hash_string(hasher, value);
+    }
+}
+
+fn valid_revocation_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
 #[cfg(test)]
@@ -661,6 +725,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_binds_a_revocation_snapshot() {
+        let payload = payload().replacen(
+            "\"signatureHex\"",
+            "\"revocationVersion\":7,\"revokedGrantIds\":[\"grant-1\"],\"revokedSessionIds\":[\"session-1\"],\"signatureHex\"",
+            1,
+        );
+        let parsed =
+            parse_and_verify_desired_state(&payload, "device-1", 2, |_, _, _| true).unwrap();
+        assert_eq!(parsed.revocation.as_ref().unwrap().version, 7);
+        assert_eq!(
+            parsed.revocation.as_ref().unwrap().revoked_session_ids,
+            ["session-1"]
+        );
+        assert_eq!(
+            parse_and_verify_desired_state(
+                &payload.replace("\"revocationVersion\":7", "\"revocationVersion\":0"),
+                "device-1",
+                2,
+                |_, _, _| true,
+            ),
+            Err(DesiredStateError::InvalidState)
+        );
+    }
+
+    #[test]
     fn rejects_digest_algorithm_downgrade_and_v2_length_mismatch() {
         let desired = crate::tunnel::TunnelDesiredState::presence_only(1);
         let legacy = format!("{:016x}", desired.legacy_v1_digest());
@@ -677,6 +766,7 @@ mod tests {
             Ok(VerifiedDesiredState {
                 desired_state: desired.clone(),
                 data_plane_assignment: None,
+                revocation: None,
             })
         );
         assert_eq!(
@@ -912,10 +1002,7 @@ mod tests {
                 .as_deref(),
             Some("grant-support")
         );
-        assert!(!desired.visitors[0]
-            .to_frp_toml()
-            .unwrap()
-            .contains("grant-support"));
+        assert_eq!(desired.visitors[0].validate(), Ok(()));
     }
 
     #[test]

@@ -29,6 +29,41 @@ fn native_port_forward_revoked(_target: &(String, i32)) -> bool {
     false
 }
 
+/// Keeps the Nexus-only session guard out of the original feature-off build.
+enum NexusCancellation {
+    #[cfg(feature = "nexus")]
+    Active(Option<crate::nexus::NativeTunnelSessionCancellation>),
+    #[cfg(not(feature = "nexus"))]
+    Disabled,
+}
+
+impl NexusCancellation {
+    fn register(target: &(String, i32)) -> Self {
+        #[cfg(feature = "nexus")]
+        {
+            Self::Active(crate::nexus::register_native_tunnel_session(target))
+        }
+        #[cfg(not(feature = "nexus"))]
+        {
+            let _ = target;
+            Self::Disabled
+        }
+    }
+
+    #[cfg(feature = "nexus")]
+    async fn cancelled(&mut self) {
+        match self {
+            Self::Active(Some(cancellation)) => cancellation.cancelled().await,
+            Self::Active(None) => std::future::pending::<()>().await,
+        }
+    }
+
+    #[cfg(not(feature = "nexus"))]
+    async fn cancelled(&mut self) {
+        std::future::pending::<()>().await
+    }
+}
+
 fn run_rdp(port: u16) {
     std::process::Command::new("cmdkey")
         .arg("/delete:localhost")
@@ -323,6 +358,9 @@ async fn run_forward(
     let mut stream = stream;
     let mut bytes = 0u64;
     let mut revoke_check = hbb_common::tokio::time::interval(std::time::Duration::from_secs(1));
+    // Native session cancellation exists only with the additive Nexus feature;
+    // feature-off PortForward must retain RustDesk's original build and flow.
+    let mut nexus_cancellation = NexusCancellation::register(&target);
     loop {
         tokio::select! {
             res = forward.next() => {
@@ -359,6 +397,12 @@ async fn run_forward(
                     log::info!("native Gateway PortForward grant is no longer live; closing session");
                     break;
                 }
+            },
+            _ = async {
+                nexus_cancellation.cancelled().await
+            } => {
+                log::info!("Nexus Tunnel revoke closed an active direct/KCP PortForward session");
+                break;
             },
         }
     }

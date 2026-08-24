@@ -5,14 +5,22 @@
 // into the production feature graph.
 mod domain;
 mod protocol;
-extern crate self as nexus_tunnel_core;
 pub use domain::*;
 pub use protocol::*;
 
-mod native_application;
-mod native_presence;
-pub use native_application::{TunnelMetrics, TunnelRuntime, TunnelRuntimeConfigError};
-pub use native_presence::{PresenceClient, PresenceClientError};
+// These modules own orchestration and external I/O separately.  Public
+// re-exports preserve the host-facing API while the native implementation is
+// gradually isolated from the retired Tunnel compatibility layout.
+pub(crate) mod application;
+pub mod infrastructure;
+mod transport;
+pub use transport::authi_socket::{
+    agent_socket_endpoint, encode_socket_io_ack, encode_socket_io_event, parse_socket_io_event,
+    AgentCancellation, AgentDispatch, AgentExecutionFinish, AgentExecutionStart,
+    AgentRpcRequest, AgentRuntimeMetrics,
+};
+pub use application::{TunnelMetrics, TunnelRuntime, TunnelRuntimeConfigError};
+pub use transport::{PresenceClient, PresenceClientError};
 
 pub mod agent;
 pub mod control;

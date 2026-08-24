@@ -1,16 +1,29 @@
 //! Thin adapter between RustDesk's native lifecycle and NexusFlow.
 
+#[cfg(feature = "nexus-agent")]
+use super::agent_host::{
+    cancel_active_agent, enqueue_agent_dispatch, is_agent_execution_active,
+    next_agent_socket_frame, register_agent_cancellation,
+    remove_queued_agent, retain_queued_agent, send_agent_socket_event,
+    send_agent_socket_ack, ActiveAgentCancellationGuard, AGENT_QUEUE_CAPACITY,
+};
+#[cfg(test)]
+use super::lifecycle::LoopbackTunnelApplicationReporter;
+use super::lifecycle::{HttpsTunnelApplicationReporter, TunnelApplicationReporter};
+#[cfg(feature = "nexus-native-tunnel")]
+use super::tunnel_gateway::{gateway_config_from_values, HeadlessPortForwardInterface};
 #[cfg(feature = "nexus-native-tunnel")]
 use std::fs;
-#[cfg(any(feature = "nexus-frp-compat-smoke", feature = "nexus-native-tunnel"))]
+#[cfg(all(feature = "nexus-agent", feature = "nexus-native-tunnel"))]
 use std::sync::Arc;
+#[cfg(any(feature = "nexus-agent", feature = "nexus-frp-compat-smoke"))]
+use std::time::Duration;
+#[cfg(feature = "nexus-frp-compat-smoke")]
+use std::{future::Future, pin::Pin};
 use std::{
-    future::Future,
     net::SocketAddr,
     path::PathBuf,
-    pin::Pin,
     sync::{Mutex, OnceLock},
-    time::Duration,
 };
 
 #[cfg(feature = "nexus-agent")]
@@ -29,68 +42,12 @@ pub use nexus_client::{
     NexusRuntime, RuntimeConfig,
 };
 #[cfg(feature = "nexus-agent")]
-use std::collections::{HashMap, VecDeque};
-#[cfg(feature = "nexus-native-tunnel")]
-use std::sync::RwLock;
-
-/// Application-layer boundary for reporting a verified Desired State outcome.
-/// Production uses the signed HTTPS adapter below; tests can inject a local
-/// recorder without weakening the production transport policy.
-pub trait TunnelApplicationReporter: Send + Sync {
-    fn report<'a>(
-        &'a self,
-        control_plane_url: &'a str,
-        version: u64,
-        digest_hex: &'a str,
-        outcome: &'a str,
-        detail: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-}
-
-struct HttpsTunnelApplicationReporter;
-
-impl TunnelApplicationReporter for HttpsTunnelApplicationReporter {
-    fn report<'a>(
-        &'a self,
-        control_plane_url: &'a str,
-        version: u64,
-        digest_hex: &'a str,
-        outcome: &'a str,
-        detail: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(record_tunnel_desired_state_application_http(
-            control_plane_url,
-            version,
-            digest_hex,
-            outcome,
-            detail,
-            false,
-        ))
-    }
-}
-
-#[cfg(test)]
-struct LoopbackTunnelApplicationReporter;
-
-#[cfg(test)]
-impl TunnelApplicationReporter for LoopbackTunnelApplicationReporter {
-    fn report<'a>(
-        &'a self,
-        control_plane_url: &'a str,
-        version: u64,
-        digest_hex: &'a str,
-        outcome: &'a str,
-        detail: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(record_tunnel_desired_state_application_loopback(
-            control_plane_url,
-            version,
-            digest_hex,
-            outcome,
-            detail,
-        ))
-    }
-}
+use nexus_client::{
+    agent_socket_endpoint, parse_socket_io_event, AgentCancellation, AgentDispatch,
+    AgentExecutionFinish, AgentExecutionStart, AgentRpcRequest, AgentRuntimeMetrics,
+};
+#[cfg(feature = "nexus-agent")]
+use std::collections::VecDeque;
 
 #[cfg(feature = "nexus-frp-compat-smoke")]
 use nexus_client::tunnel::{
@@ -103,154 +60,9 @@ fn runtime_slot() -> &'static Mutex<Option<NexusRuntime>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
-fn host_control_plane_url() -> &'static Mutex<Option<String>> {
+pub(super) fn host_control_plane_url() -> &'static Mutex<Option<String>> {
     static URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     URL.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(feature = "nexus-agent")]
-fn active_agent_cancellations(
-) -> &'static Mutex<HashMap<String, hbb_common::tokio_util::sync::CancellationToken>> {
-    static CANCELLATIONS: OnceLock<
-        Mutex<HashMap<String, hbb_common::tokio_util::sync::CancellationToken>>,
-    > = OnceLock::new();
-    CANCELLATIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(feature = "nexus-agent")]
-fn register_agent_cancellation(
-    execution_id: &str,
-) -> Option<hbb_common::tokio_util::sync::CancellationToken> {
-    let mut active = active_agent_cancellations().lock().ok()?;
-    // One Host runs one Agent execution at a time. The Socket ACK rejects
-    // additional work instead of building an unbounded in-memory queue.
-    if !active.is_empty() {
-        return None;
-    }
-    let cancellation = hbb_common::tokio_util::sync::CancellationToken::new();
-    active.insert(execution_id.to_string(), cancellation.clone());
-    Some(cancellation)
-}
-
-#[cfg(feature = "nexus-agent")]
-fn cancel_active_agent(execution_id: &str) -> bool {
-    let cancellation = active_agent_cancellations()
-        .lock()
-        .ok()
-        .and_then(|active| active.get(execution_id).cloned());
-    cancellation.is_some_and(|cancellation| {
-        cancellation.cancel();
-        true
-    })
-}
-
-#[cfg(feature = "nexus-agent")]
-struct ActiveAgentCancellationGuard(String);
-
-#[cfg(feature = "nexus-agent")]
-impl Drop for ActiveAgentCancellationGuard {
-    fn drop(&mut self) {
-        if let Ok(mut active) = active_agent_cancellations().lock() {
-            active.remove(&self.0);
-        }
-    }
-}
-
-/// Headless adapter for the already-existing RustDesk PortForward client.
-/// It owns no GUI state and turns UI-only notifications into logs while
-/// retaining RustDesk's native hash and Login protocol handlers.
-#[cfg(feature = "nexus-native-tunnel")]
-#[derive(Clone)]
-struct HeadlessPortForwardInterface {
-    lch: Arc<RwLock<crate::client::LoginConfigHandler>>,
-}
-
-#[cfg(feature = "nexus-native-tunnel")]
-impl HeadlessPortForwardInterface {
-    fn new(id: String, force_relay: bool) -> Self {
-        Self::with_conn_type(
-            id,
-            force_relay,
-            hbb_common::rendezvous_proto::ConnType::PORT_FORWARD,
-        )
-    }
-
-    fn with_conn_type(
-        id: String,
-        force_relay: bool,
-        conn_type: hbb_common::rendezvous_proto::ConnType,
-    ) -> Self {
-        let mut handler = crate::client::LoginConfigHandler::default();
-        handler.initialize(id, conn_type, None, force_relay, None, None, None);
-        Self {
-            lch: Arc::new(RwLock::new(handler)),
-        }
-    }
-}
-
-#[cfg(feature = "nexus-native-tunnel")]
-#[async_trait::async_trait]
-impl crate::client::Interface for HeadlessPortForwardInterface {
-    fn send(&self, _data: crate::client::Data) {}
-
-    fn msgbox(&self, msgtype: &str, title: &str, text: &str, _link: &str) {
-        hbb_common::log::warn!("Nexus headless PortForward {msgtype}: {title}: {text}");
-    }
-
-    fn handle_login_error(&self, error: &str) -> bool {
-        hbb_common::log::warn!("Nexus headless PortForward login rejected: {error}");
-        false
-    }
-
-    fn handle_peer_info(&self, peer_info: hbb_common::message_proto::PeerInfo) {
-        self.lch.write().unwrap().handle_peer_info(&peer_info);
-    }
-
-    fn set_multiple_windows_session(
-        &self,
-        _sessions: Vec<hbb_common::message_proto::WindowsSession>,
-    ) {
-    }
-
-    async fn handle_hash(
-        &self,
-        password: &str,
-        hash: hbb_common::message_proto::Hash,
-        peer: &mut hbb_common::Stream,
-    ) {
-        crate::client::handle_hash(self.lch.clone(), password, hash, self, peer).await;
-    }
-
-    async fn handle_login_from_ui(
-        &self,
-        os_username: String,
-        os_password: String,
-        password: String,
-        remember: bool,
-        peer: &mut hbb_common::Stream,
-    ) {
-        crate::client::handle_login_from_ui(
-            self.lch.clone(),
-            os_username,
-            os_password,
-            password,
-            remember,
-            peer,
-        )
-        .await;
-    }
-
-    async fn handle_test_delay(
-        &self,
-        delay: hbb_common::message_proto::TestDelay,
-        peer: &mut hbb_common::Stream,
-    ) {
-        crate::client::handle_test_delay(delay, peer).await;
-    }
-
-    fn get_lch(&self) -> Arc<RwLock<crate::client::LoginConfigHandler>> {
-        self.lch.clone()
-    }
 }
 
 /// Deployment-owned inputs required to attach Tunnel to the native service.
@@ -477,67 +289,6 @@ async fn run_headless_gateway_from_env_with_loopback_http(
     )
     .await
     .map_err(|error| error.to_string())
-}
-
-#[cfg(feature = "nexus-native-tunnel")]
-#[derive(Debug)]
-struct GatewayConfig {
-    credential_path: PathBuf,
-    peer_id: String,
-    bind_addr: SocketAddr,
-    token: String,
-    device_uid: String,
-    control_plane_url: String,
-    grant_id: String,
-}
-
-#[cfg(feature = "nexus-native-tunnel")]
-fn gateway_config_from_values(
-    credential_path: Option<PathBuf>,
-    peer_id: Option<String>,
-    bind: Option<String>,
-    token: Option<String>,
-    device_uid: Option<String>,
-    control_plane_url: Option<String>,
-    grant_id: Option<String>,
-) -> Result<GatewayConfig, String> {
-    let credential_path = credential_path.ok_or("NEXUS_TUNNEL_CREDENTIAL_FILE is required")?;
-    let peer_id = peer_id
-        .filter(|value| !value.trim().is_empty())
-        .ok_or("NEXUS_GATEWAY_PEER_ID is required")?;
-    let bind_addr: SocketAddr = bind
-        .unwrap_or_else(|| "127.0.0.1:21119".into())
-        .parse()
-        .map_err(|_| "NEXUS_GATEWAY_BIND must be an IPv4 socket address".to_string())?;
-    if !bind_addr.is_ipv4() {
-        return Err("NEXUS_GATEWAY_BIND must be an IPv4 socket address".into());
-    }
-    if bind_addr.port() == 0 {
-        return Err("NEXUS_GATEWAY_BIND must use a non-zero port".into());
-    }
-    let device_uid = device_uid
-        .filter(|value| !value.trim().is_empty())
-        .ok_or("NEXUS_GATEWAY_DEVICE_UID is required")?;
-    let control_plane_url = control_plane_url
-        .filter(|value| !value.trim().is_empty())
-        .ok_or("NEXUS_GATEWAY_CONTROL_PLANE_URL is required")?;
-    let grant_id = grant_id
-        .filter(|value| !value.is_empty())
-        .filter(|value| {
-            value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-        .ok_or("NEXUS_GATEWAY_GRANT_ID is invalid")?;
-    Ok(GatewayConfig {
-        credential_path,
-        peer_id,
-        bind_addr,
-        token: token.unwrap_or_default(),
-        device_uid,
-        control_plane_url,
-        grant_id,
-    })
 }
 
 fn require_https_control_plane(control_plane_url: &str) -> Result<(), String> {
@@ -870,214 +621,16 @@ pub fn start_host_service(config: TunnelHostConfig) -> Result<(), &'static str> 
     // callers cannot replace it with an arbitrary endpoint or payload.
     *host_control_plane_url().lock().unwrap() = Some(control_plane_url);
     let cancellation = hbb_common::tokio_util::sync::CancellationToken::new();
-    let task = handle.spawn(run_host_service(config, cancellation.clone()));
+    let task = handle.spawn(super::tunnel_host::run_host_service(
+        config,
+        cancellation.clone(),
+    ));
     let mut slot = host_service_slot().lock().unwrap();
     if let Some(previous) = slot.replace(HostServiceTask { cancellation, task }) {
         previous.cancellation.cancel();
         previous.task.abort();
     }
     Ok(())
-}
-
-const PRESENCE_RETRY_MAX_SECS: u64 = 30;
-
-fn new_presence_boot_uuid() -> uuid::Uuid {
-    // UUID v4 draws from the operating-system CSPRNG. A new client starts its
-    // packet sequence at zero, so every registration needs a fresh nonce domain.
-    uuid::Uuid::new_v4()
-}
-
-fn next_presence_boot_id() -> u32 {
-    new_presence_boot_uuid().as_u128() as u32
-}
-
-fn next_presence_retry_secs(current: u64) -> u64 {
-    current.clamp(1, PRESENCE_RETRY_MAX_SECS)
-}
-
-type PresenceFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-struct PresenceHostOps<S> {
-    refresh: Box<dyn FnMut() -> PresenceFuture<()> + Send>,
-    establish: Box<dyn FnMut(u32) -> PresenceFuture<Result<S, String>> + Send>,
-    heartbeat: Box<
-        dyn for<'a> FnMut(
-                &'a mut S,
-            )
-                -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>
-            + Send,
-    >,
-    heartbeat_interval_secs: Box<dyn Fn() -> u64 + Send>,
-    lease_needs_refresh: Box<dyn Fn(&S) -> bool + Send>,
-    sleep: Box<dyn FnMut(u64) -> PresenceFuture<()> + Send>,
-    next_boot_id: Box<dyn FnMut() -> u32 + Send>,
-}
-
-async fn run_presence_loop<S>(
-    mut ops: PresenceHostOps<S>,
-    cancellation: hbb_common::tokio_util::sync::CancellationToken,
-) {
-    let mut retry_secs = 1;
-    loop {
-        hbb_common::tokio::select! {
-            _ = cancellation.cancelled() => return,
-            _ = (ops.refresh)() => {},
-        }
-        let boot_id = (ops.next_boot_id)();
-        let mut session = match hbb_common::tokio::select! {
-            _ = cancellation.cancelled() => return,
-            result = (ops.establish)(boot_id) => result,
-        } {
-            Ok(session) => {
-                retry_secs = 1;
-                session
-            }
-            Err(error) => {
-                hbb_common::log::warn!("Nexus Tunnel Presence registration failed: {error}");
-                hbb_common::tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    _ = (ops.sleep)(retry_secs) => {},
-                }
-                retry_secs = next_presence_retry_secs(retry_secs.saturating_mul(2));
-                continue;
-            }
-        };
-
-        loop {
-            if let Err(error) = hbb_common::tokio::select! {
-                _ = cancellation.cancelled() => return,
-                result = (ops.heartbeat)(&mut session) => result,
-            } {
-                hbb_common::log::warn!("Nexus Tunnel Presence heartbeat failed: {error}");
-                break;
-            }
-            hbb_common::tokio::select! {
-                _ = cancellation.cancelled() => return,
-                _ = (ops.sleep)((ops.heartbeat_interval_secs)()) => {},
-            }
-            if (ops.lease_needs_refresh)(&session) {
-                // A configured fixed bind cannot host two UDP sessions. Release
-                // the old lease before creating its fresh boot-ID replacement.
-                drop(session);
-                match hbb_common::tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    result = (ops.establish)((ops.next_boot_id)()) => result,
-                } {
-                    Ok(replacement) => session = replacement,
-                    Err(error) => {
-                        hbb_common::log::warn!(
-                            "Nexus Tunnel Presence lease refresh failed: {error}"
-                        );
-                        break;
-                    }
-                }
-            }
-            hbb_common::tokio::select! {
-                _ = cancellation.cancelled() => return,
-                _ = (ops.refresh)() => {},
-            }
-        }
-        hbb_common::tokio::select! {
-            _ = cancellation.cancelled() => return,
-            _ = (ops.sleep)(retry_secs) => {},
-        }
-        retry_secs = next_presence_retry_secs(retry_secs.saturating_mul(2));
-    }
-}
-
-async fn run_host_service(
-    config: TunnelHostConfig,
-    cancellation: hbb_common::tokio_util::sync::CancellationToken,
-) {
-    let control_plane_url = config.control_plane_url;
-    let refresh_url = control_plane_url.clone();
-    let establish_url = control_plane_url.clone();
-    let presence_bind = config.presence_bind;
-    let presence_gateway = config.presence_gateway;
-    #[cfg(feature = "nexus-agent")]
-    let agent_task = hbb_common::tokio::spawn(run_agent_socket_loop(
-        control_plane_url.clone(),
-        cancellation.clone(),
-    ));
-    run_presence_loop(
-        PresenceHostOps {
-            refresh: Box::new(move || {
-                let control_plane_url = refresh_url.clone();
-                Box::pin(async move {
-                    if let Err(error) = refresh_tunnel_desired_state(&control_plane_url).await {
-                        hbb_common::log::warn!(
-                            "Nexus Tunnel Desired State refresh failed: {error}"
-                        );
-                    }
-                })
-            }),
-            establish: Box::new(move |boot_id| {
-                let control_plane_url = establish_url.clone();
-                Box::pin(async move {
-                    establish_presence_session(
-                        &control_plane_url,
-                        presence_bind,
-                        presence_gateway,
-                        boot_id,
-                    )
-                    .await
-                })
-            }),
-            heartbeat: Box::new(|session| {
-                Box::pin(async move {
-                    let (config_version, config_digest) = status_snapshot()
-                        .map(|status| {
-                            (
-                                status.tunnel.desired_version.unwrap_or_default(),
-                                status.tunnel.desired_digest.unwrap_or_default(),
-                            )
-                        })
-                        .unwrap_or_default();
-                    session
-                        .send_heartbeat(PresenceHeartbeat {
-                            config_version,
-                            config_digest,
-                            capability_digest: 0,
-                        })
-                        .await
-                })
-            }),
-            heartbeat_interval_secs: Box::new(|| {
-                status_snapshot()
-                    .and_then(|_| {
-                        runtime_slot()
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|runtime| runtime.tunnel().desired_state())
-                            .map(|desired| desired.policy.presence_interval_secs.into())
-                    })
-                    .unwrap_or(30)
-            }),
-            lease_needs_refresh: Box::new(|session| {
-                let interval_secs = status_snapshot()
-                    .and_then(|_| {
-                        runtime_slot()
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|runtime| runtime.tunnel().desired_state())
-                            .map(|desired| desired.policy.presence_interval_secs)
-                    })
-                    .unwrap_or(30);
-                session.lease().expires_at
-                    <= hbb_common::get_time().saturating_add(interval_secs.into())
-            }),
-            sleep: Box::new(|secs| {
-                Box::pin(hbb_common::tokio::time::sleep(Duration::from_secs(secs)))
-            }),
-            next_boot_id: Box::new(next_presence_boot_id),
-        },
-        cancellation,
-    )
-    .await;
-    #[cfg(feature = "nexus-agent")]
-    agent_task.abort();
 }
 
 #[cfg(feature = "nexus-agent")]
@@ -1091,15 +644,13 @@ const AGENT_MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 #[cfg(feature = "nexus-agent")]
 const AGENT_MAX_PROMPT_BYTES: usize = 64 * 1_024;
 #[cfg(feature = "nexus-agent")]
-const AGENT_QUEUE_CAPACITY: usize = 32;
-#[cfg(feature = "nexus-agent")]
 const AGENT_FINISH_RETRY_DELAYS_SECS: [u64; 5] = [1, 2, 5, 10, 30];
 
 /// Keeps the machine-bound Agent channel independent from Presence. A broken
 /// task connection is retried with a fresh short-lived credential; it never
 /// stops RustDesk's remote-desktop or Tunnel host loop.
 #[cfg(feature = "nexus-agent")]
-async fn run_agent_socket_loop(
+pub(super) async fn run_agent_socket_loop(
     control_plane_url: String,
     cancellation: hbb_common::tokio_util::sync::CancellationToken,
 ) {
@@ -1140,26 +691,18 @@ fn set_agent_health(health: AgentHealthState) {
 }
 
 #[cfg(feature = "nexus-agent")]
-fn set_agent_queue_depth(depth: usize) {
+fn set_agent_queue_depth(control_plane_url: &str, depth: usize) {
     if let Ok(mut runtime) = runtime_slot().lock() {
         if let Some(runtime) = runtime.as_mut() {
             runtime.set_agent_queue_depth(depth);
         }
     }
-}
-
-#[cfg(feature = "nexus-agent")]
-fn agent_socket_endpoint(control_plane_url: &str) -> Result<String, String> {
-    let mut url = reqwest::Url::parse(control_plane_url)
-        .map_err(|_| "Nexus control-plane URL is invalid".to_string())?;
-    if url.scheme() != "https" {
-        return Err("Nexus control-plane URL must use HTTPS".into());
-    }
-    url.set_scheme("wss")
-        .map_err(|_| "Nexus control-plane URL is invalid".to_string())?;
-    url.set_path("/v1/updates/");
-    url.set_query(Some("EIO=4&transport=websocket"));
-    Ok(url.into())
+    let control_plane_url = control_plane_url.to_string();
+    // Queue reporting is observational. A failed control-plane request must
+    // never delay Socket.IO dispatch or RustDesk remote-desktop traffic.
+    hbb_common::tokio::spawn(async move {
+        let _ = report_agent_queue_depth(&control_plane_url, depth).await;
+    });
 }
 
 #[cfg(feature = "nexus-agent")]
@@ -1254,7 +797,7 @@ async fn run_agent_socket_frames(
     let (completed_sender, mut completed_receiver) =
         hbb_common::tokio::sync::mpsc::unbounded_channel::<()>();
     let mut queued: VecDeque<AgentDispatch> = VecDeque::with_capacity(AGENT_QUEUE_CAPACITY);
-    set_agent_queue_depth(0);
+    set_agent_queue_depth(control_plane_url, 0);
     loop {
         let frame = hbb_common::tokio::select! {
             _ = cancellation.cancelled() => return Err("Nexus Agent Socket cancelled".into()),
@@ -1274,7 +817,7 @@ async fn run_agent_socket_frames(
                         retain_queued_agent(&mut queued, dispatch);
                     }
                 }
-                set_agent_queue_depth(queued.len());
+                set_agent_queue_depth(control_plane_url, queued.len());
                 continue;
             }
             frame = socket.next() => frame,
@@ -1290,7 +833,7 @@ async fn run_agent_socket_frames(
                 .map_err(|_| "Nexus Agent Socket heartbeat failed".to_string())?;
             continue;
         }
-        let Some((ack_id, event, payload)) = parse_agent_socket_event(&frame) else {
+        let Some((ack_id, event, payload)) = parse_socket_io_event(&frame) else {
             continue;
         };
         if event == "rpc-registered" {
@@ -1331,13 +874,10 @@ async fn run_agent_socket_frames(
                 }
                 _ => false,
             };
-        set_agent_queue_depth(queued.len());
+        set_agent_queue_depth(control_plane_url, queued.len());
         if let Some(ack_id) = ack_id {
             socket
-                .send_text(format!(
-                    "43{ack_id}{}",
-                    serde_json::json!([{ "accepted": accepted }])
-                ))
+                .send_text(send_agent_socket_ack(&ack_id, accepted))
                 .await
                 .map_err(|_| "Nexus Agent Socket acknowledgment failed".to_string())?;
         }
@@ -1353,10 +893,7 @@ fn queue_or_launch_agent(
     completed_sender: hbb_common::tokio::sync::mpsc::UnboundedSender<()>,
     queued: &mut VecDeque<AgentDispatch>,
 ) -> bool {
-    if active_agent_cancellations()
-        .lock()
-        .ok()
-        .is_some_and(|active| active.contains_key(&dispatch.execution_id))
+    if is_agent_execution_active(&dispatch.execution_id)
         || queued
             .iter()
             .any(|queued| queued.execution_id == dispatch.execution_id)
@@ -1373,33 +910,6 @@ fn queue_or_launch_agent(
         return true;
     }
     enqueue_agent_dispatch(queued, dispatch)
-}
-
-#[cfg(feature = "nexus-agent")]
-fn enqueue_agent_dispatch(queued: &mut VecDeque<AgentDispatch>, dispatch: AgentDispatch) -> bool {
-    if queued.len() >= AGENT_QUEUE_CAPACITY
-        || queued
-            .iter()
-            .any(|queued| queued.execution_id == dispatch.execution_id)
-    {
-        return false;
-    }
-    queued.push_back(dispatch);
-    true
-}
-
-#[cfg(feature = "nexus-agent")]
-fn remove_queued_agent(queued: &mut VecDeque<AgentDispatch>, execution_id: &str) -> bool {
-    queued
-        .iter()
-        .position(|queued| queued.execution_id == execution_id)
-        .map(|index| queued.remove(index))
-        .is_some()
-}
-
-#[cfg(feature = "nexus-agent")]
-fn retain_queued_agent(queued: &mut VecDeque<AgentDispatch>, dispatch: AgentDispatch) {
-    queued.push_front(dispatch);
 }
 
 #[cfg(feature = "nexus-agent")]
@@ -1427,46 +937,6 @@ fn launch_dispatched_agent(
         let _ = completed_sender.send(());
     });
     true
-}
-
-#[cfg(feature = "nexus-agent")]
-async fn next_agent_socket_frame(
-    socket: &mut WsFramedStream,
-    cancellation: &hbb_common::tokio_util::sync::CancellationToken,
-) -> Result<String, String> {
-    let frame = hbb_common::tokio::select! {
-        _ = cancellation.cancelled() => return Err("Nexus Agent Socket cancelled".into()),
-        frame = socket.next() => frame,
-    }
-    .ok_or_else(|| "Nexus Agent Socket closed".to_string())?
-    .map_err(|_| "Nexus Agent Socket read failed".to_string())?;
-    String::from_utf8(frame.to_vec()).map_err(|_| "Nexus Agent Socket sent invalid UTF-8".into())
-}
-
-#[cfg(feature = "nexus-agent")]
-async fn send_agent_socket_event(
-    socket: &mut WsFramedStream,
-    event: &str,
-    payload: &serde_json::Value,
-) -> Result<(), String> {
-    socket
-        .send_text(format!("42{}", serde_json::json!([event, payload])))
-        .await
-        .map_err(|_| "Nexus Agent Socket write failed".to_string())
-}
-
-#[cfg(feature = "nexus-agent")]
-fn parse_agent_socket_event(frame: &str) -> Option<(Option<&str>, String, serde_json::Value)> {
-    let body = frame.strip_prefix("42")?;
-    let array_at = body.find('[')?;
-    let ack_id = (!body[..array_at].is_empty()).then_some(&body[..array_at]);
-    let values: Vec<serde_json::Value> = serde_json::from_str(&body[array_at..]).ok()?;
-    let event = values.first()?.as_str()?.to_string();
-    Some((
-        ack_id,
-        event,
-        values.get(1).cloned().unwrap_or(serde_json::Value::Null),
-    ))
 }
 
 #[cfg(feature = "nexus-agent")]
@@ -1825,6 +1295,20 @@ async fn report_agent_execution_finish(
 }
 
 #[cfg(feature = "nexus-agent")]
+async fn report_agent_queue_depth(control_plane_url: &str, depth: usize) -> Result<(), String> {
+    let queue_depth = u8::try_from(depth)
+        .ok()
+        .filter(|depth| *depth <= AGENT_QUEUE_CAPACITY as u8)
+        .ok_or_else(|| "Agent queue depth is invalid".to_string())?;
+    post_agent_execution(
+        control_plane_url,
+        "/v1/device/agent/runtime-metrics",
+        &AgentRuntimeMetrics { queue_depth },
+    )
+    .await
+}
+
+#[cfg(feature = "nexus-agent")]
 async fn post_agent_execution(
     control_plane_url: &str,
     path: &str,
@@ -1896,6 +1380,19 @@ pub fn status_snapshot() -> Option<ClientStatus> {
         .unwrap()
         .as_ref()
         .map(|runtime| runtime.status().clone())
+}
+
+/// Reads the applied Desired State policy without exposing the runtime slot to
+/// Host task ownership. A missing state retains the established 30-second
+/// Presence cadence.
+pub(super) fn presence_interval_secs() -> i64 {
+    runtime_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|runtime| runtime.tunnel().desired_state())
+        .map(|desired| desired.policy.presence_interval_secs.into())
+        .unwrap_or(30)
 }
 
 /// Converts the in-process runtime snapshot into the deliberately small,
@@ -1984,52 +1481,6 @@ pub struct MachineSocketLease {
     pub expires_at: i64,
 }
 
-#[cfg(feature = "nexus-agent")]
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentDispatch {
-    execution_id: String,
-    dispatch_token: String,
-    tenant_id: String,
-    provider: String,
-    model: Option<String>,
-    prompt: String,
-    timeout_ms: u64,
-    #[serde(default)]
-    tunnel_access: bool,
-}
-
-#[cfg(feature = "nexus-agent")]
-#[derive(Debug, serde::Deserialize)]
-struct AgentRpcRequest {
-    method: String,
-    params: serde_json::Value,
-}
-
-#[cfg(feature = "nexus-agent")]
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentCancellation {
-    execution_id: String,
-}
-
-#[cfg(feature = "nexus-agent")]
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentExecutionStart<'a> {
-    dispatch_token: &'a str,
-}
-
-#[cfg(feature = "nexus-agent")]
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentExecutionFinish<'a> {
-    dispatch_token: &'a str,
-    status: &'a str,
-    exit_code: Option<i32>,
-    error_code: Option<&'a str>,
-}
-
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesiredStateSigningKeyResponse {
@@ -2050,6 +1501,8 @@ struct PortForwardCredentialResponse {
     key_id: String,
     source_device_uid: String,
     publishing_device_uid: String,
+    tenant_ref: String,
+    relay_pool_id: String,
     relay_node_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     publishing_rustdesk_id: String,
@@ -2526,12 +1979,14 @@ async fn verify_port_forward_credential(
     base_url: &str,
     credential: &PortForwardCredentialResponse,
 ) -> Result<(), String> {
-    if credential.protocol_version != 1
+    if credential.protocol_version != 2
         || credential.grant_id.trim().is_empty()
         || credential.session_id.trim().is_empty()
         || credential.key_id.trim().is_empty()
         || credential.source_device_uid.trim().is_empty()
         || credential.publishing_device_uid.trim().is_empty()
+        || credential.tenant_ref.trim().is_empty()
+        || credential.relay_pool_id.trim().is_empty()
         || credential.relay_node_id.trim().is_empty()
         || credential.target_digest.trim().is_empty()
         || credential.target_host.trim().is_empty()
@@ -2555,6 +2010,8 @@ async fn verify_port_forward_credential(
         key_id: credential.key_id.clone(),
         source_device_uid: credential.source_device_uid.clone(),
         publishing_device_uid: credential.publishing_device_uid.clone(),
+        tenant_ref: credential.tenant_ref.clone(),
+        relay_pool_id: credential.relay_pool_id.clone(),
         relay_node_id: credential.relay_node_id.clone(),
         ..Default::default()
     };
@@ -2646,6 +2103,9 @@ pub fn apply_verified_tunnel_desired_state(
 
     #[cfg(not(feature = "nexus-frp-compat-smoke"))]
     {
+        if let Some(revocation) = verified.revocation.as_ref() {
+            crate::nexus::apply_desired_state_revocation(revocation);
+        }
         let mut slot = runtime_slot().lock().unwrap();
         let runtime = slot.as_mut().ok_or("Nexus runtime is not running")?;
         runtime
@@ -2671,6 +2131,9 @@ async fn apply_verified_tunnel_desired_state_async_with_application(
     verified: VerifiedDesiredState,
     control_plane_url: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(revocation) = verified.revocation.as_ref() {
+        crate::nexus::apply_desired_state_revocation(revocation);
+    }
     let next_application = control_plane_url.map(|control_plane_url| GenerationApplication {
         control_plane_url: control_plane_url.into(),
         version: verified.desired_state.version.0,
@@ -2855,6 +2318,9 @@ async fn apply_verified_tunnel_desired_state_async_with_application(
 fn apply_verified_tunnel_desired_state_with_frp(
     verified: VerifiedDesiredState,
 ) -> Result<(), &'static str> {
+    if let Some(revocation) = verified.revocation.as_ref() {
+        crate::nexus::apply_desired_state_revocation(revocation);
+    }
     let active = verified.desired_state.mode == TunnelMode::Active;
     let assignment = verified.data_plane_assignment.as_ref();
     if active && assignment.is_none() {
@@ -3009,7 +2475,7 @@ pub async fn record_tunnel_desired_state_application(
         .await
 }
 
-async fn record_tunnel_desired_state_application_http(
+pub(super) async fn record_tunnel_desired_state_application_http(
     control_plane_url: &str,
     version: u64,
     digest_hex: &str,
@@ -3052,7 +2518,7 @@ async fn record_tunnel_desired_state_application_http(
 }
 
 #[cfg(test)]
-async fn record_tunnel_desired_state_application_loopback(
+pub(super) async fn record_tunnel_desired_state_application_loopback(
     control_plane_url: &str,
     version: u64,
     digest_hex: &str,
@@ -3232,94 +2698,15 @@ pub async fn establish_presence_session(
     Ok(PresenceSession { client, lease })
 }
 
-pub fn handle_request(request: Request) -> Response {
-    match request {
-        Request::GetStatus(GetStatusRequest { version }) if version == IPC_VERSION => {
-            Response::Status(StatusResponse {
-                version,
-                status: status_snapshot(),
-            })
-        }
-        Request::RefreshDesiredState(RefreshDesiredStateRequest { version })
-            if version == IPC_VERSION =>
-        {
-            let Some(url) = host_control_plane_url().lock().unwrap().clone() else {
-                return Response::Error(ErrorResponse {
-                    version: IPC_VERSION,
-                    message: "Nexus host service is not running".into(),
-                });
-            };
-            let Ok(handle) = hbb_common::tokio::runtime::Handle::try_current() else {
-                return Response::Error(ErrorResponse {
-                    version: IPC_VERSION,
-                    message: "Nexus IPC refresh requires the RustDesk Tokio runtime".into(),
-                });
-            };
-            handle.spawn(async move {
-                if let Err(error) = refresh_tunnel_desired_state(&url).await {
-                    hbb_common::log::warn!("Nexus IPC Desired State refresh failed: {error}");
-                }
-            });
-            Response::RefreshScheduled(RefreshScheduledResponse { version })
-        }
-        #[cfg(feature = "nexus-native-tunnel")]
-        Request::RefreshPortForwardCredential(RefreshPortForwardCredentialRequest {
-            version,
-            grant_id,
-        }) if version == IPC_VERSION => {
-            let Some(url) = host_control_plane_url().lock().unwrap().clone() else {
-                return Response::Error(ErrorResponse {
-                    version: IPC_VERSION,
-                    message: "Nexus host service is not running".into(),
-                });
-            };
-            let Some(path) = std::env::var_os("NEXUS_TUNNEL_CREDENTIAL_FILE") else {
-                return Response::Error(ErrorResponse {
-                    version: IPC_VERSION,
-                    message: "Nexus PortForward credential path is not configured".into(),
-                });
-            };
-            let handle = hbb_common::tokio::runtime::Handle::current();
-            handle.spawn(async move {
-                if let Err(error) =
-                    refresh_port_forward_credential(&url, &grant_id, path.as_ref()).await
-                {
-                    hbb_common::log::warn!(
-                        "Nexus IPC PortForward credential refresh failed: {error}"
-                    );
-                }
-            });
-            Response::PortForwardCredentialRefreshScheduled(RefreshScheduledResponse { version })
-        }
-        Request::GetStatus(GetStatusRequest { version }) => Response::Error(ErrorResponse {
-            version: IPC_VERSION,
-            message: format!("unsupported nexus ipc version {version}"),
-        }),
-        Request::RefreshDesiredState(RefreshDesiredStateRequest { version }) => {
-            Response::Error(ErrorResponse {
-                version: IPC_VERSION,
-                message: format!("unsupported nexus ipc version {version}"),
-            })
-        }
-        Request::RefreshPortForwardCredential(RefreshPortForwardCredentialRequest {
-            version,
-            ..
-        }) => Response::Error(ErrorResponse {
-            version: IPC_VERSION,
-            message: format!("unsupported nexus ipc version {version}"),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::tunnel_host::{self, PresenceHostOps};
     use super::{
         apply_and_report_tunnel_desired_state, apply_verified_tunnel_desired_state,
-        bind_device_uid, establish_presence_client, handle_request,
-        record_tunnel_desired_state_application, record_tunnel_desired_state_application_loopback,
-        start_runtime, status_snapshot, stop_runtime, ErrorResponse, GetStatusRequest, HealthState,
-        LoopbackTunnelApplicationReporter, PresenceHeartbeat, PresenceHostOps, PresenceSession,
-        PresenceSessionKeyLease, RefreshDesiredStateRequest, Request, Response,
+        bind_device_uid, establish_presence_client, record_tunnel_desired_state_application,
+        record_tunnel_desired_state_application_loopback, start_runtime, status_snapshot,
+        stop_runtime, ErrorResponse, GetStatusRequest, HealthState, PresenceHeartbeat,
+        PresenceSession, PresenceSessionKeyLease, RefreshDesiredStateRequest, Request, Response,
         TunnelApplicationReporter, TunnelHostConfig, TunnelState, VerifiedDesiredState,
     };
     use nexus_client::tunnel::{ConfigDigest, ConfigVersion, PresenceClient};
@@ -3494,12 +2881,14 @@ mod tests {
                 grant_id: "grant-1".into(),
                 session_id: "session-1".into(),
                 target_digest: "ab".repeat(32),
-                protocol_version: 1,
+                protocol_version: 2,
                 expires_at,
                 nonce: nonce.clone().into(),
                 key_id: "key-1".into(),
                 source_device_uid: "device-1".into(),
                 publishing_device_uid: "publisher-1".into(),
+                tenant_ref: "tenant-1".into(),
+                relay_pool_id: "relay-1".into(),
                 relay_node_id: "relay-1".into(),
                 ..Default::default()
             };
@@ -3518,6 +2907,8 @@ mod tests {
                 "keyId": context.key_id,
                 "sourceDeviceUid": context.source_device_uid,
                 "publishingDeviceUid": context.publishing_device_uid,
+                "tenantRef": context.tenant_ref,
+                "relayPoolId": context.relay_pool_id,
                 "relayNodeId": context.relay_node_id,
                 "targetHost": "127.0.0.1",
                 "targetPort": 22,
@@ -3653,14 +3044,14 @@ mod tests {
     #[test]
     fn presence_restarts_use_a_csprng_boot_source_and_bounded_backoff() {
         assert_eq!(
-            super::new_presence_boot_uuid().get_version(),
+            tunnel_host::new_presence_boot_uuid().get_version(),
             Some(uuid::Version::Random)
         );
-        assert_eq!(super::next_presence_retry_secs(0), 1);
-        assert_eq!(super::next_presence_retry_secs(4), 4);
+        assert_eq!(tunnel_host::next_presence_retry_secs(0), 1);
+        assert_eq!(tunnel_host::next_presence_retry_secs(4), 4);
         assert_eq!(
-            super::next_presence_retry_secs(u64::MAX),
-            super::PRESENCE_RETRY_MAX_SECS
+            tunnel_host::next_presence_retry_secs(u64::MAX),
+            tunnel_host::PRESENCE_RETRY_MAX_SECS
         );
     }
 
@@ -3690,7 +3081,7 @@ mod tests {
         let heartbeat_cancellation = cancellation.clone();
         let mut boot_id = 0;
 
-        let task = hbb_common::tokio::spawn(super::run_presence_loop(
+        let task = hbb_common::tokio::spawn(tunnel_host::run_presence_loop(
             PresenceHostOps {
                 refresh: Box::new(|| Box::pin(async {})),
                 establish: Box::new(move |next_boot_id| {
@@ -3753,7 +3144,7 @@ mod tests {
         assert!(state
             .sleeps
             .iter()
-            .all(|secs| *secs <= super::PRESENCE_RETRY_MAX_SECS));
+            .all(|secs| *secs <= tunnel_host::PRESENCE_RETRY_MAX_SECS));
     }
 
     #[test]
@@ -3779,7 +3170,8 @@ mod tests {
 
     #[test]
     fn ipc_handler_rejects_unknown_versions() {
-        let response = handle_request(Request::GetStatus(GetStatusRequest { version: 99 }));
+        let response =
+            crate::nexus::handle_request(Request::GetStatus(GetStatusRequest { version: 99 }));
 
         match response {
             Response::Error(error) => {
@@ -3792,7 +3184,7 @@ mod tests {
     #[test]
     fn ipc_refresh_never_accepts_raw_configuration_or_runs_without_host_service() {
         stop_runtime();
-        let response = handle_request(Request::RefreshDesiredState(
+        let response = crate::nexus::handle_request(Request::RefreshDesiredState(
             RefreshDesiredStateRequest::default(),
         ));
         assert!(matches!(
@@ -3926,6 +3318,7 @@ mod tests {
         apply_verified_tunnel_desired_state(VerifiedDesiredState {
             desired_state: nexus_client::tunnel::TunnelDesiredState::presence_only(2),
             data_plane_assignment: None,
+            revocation: None,
         })
         .unwrap();
 
@@ -3949,6 +3342,7 @@ mod tests {
                 VerifiedDesiredState {
                     desired_state,
                     data_plane_assignment: None,
+                    revocation: None,
                 },
                 &reporter,
             ))
@@ -3976,6 +3370,7 @@ mod tests {
                     VerifiedDesiredState {
                         desired_state,
                         data_plane_assignment: None,
+                        revocation: None,
                     },
                     &reporter,
                 ))
@@ -4015,6 +3410,7 @@ mod tests {
                     VerifiedDesiredState {
                         desired_state,
                         data_plane_assignment: None,
+                        revocation: None,
                     },
                     &reporter,
                 ))
@@ -4064,6 +3460,7 @@ mod tests {
                     VerifiedDesiredState {
                         desired_state,
                         data_plane_assignment: Some(assignment),
+                        revocation: None,
                     },
                     &reporter,
                 ))
@@ -4278,6 +3675,7 @@ mod tests {
                     },
                     remote_ports: vec![("edge://host-service".into(), remote_port)],
                 }),
+                revocation: None,
             }
         }
 
@@ -4384,6 +3782,7 @@ mod tests {
                     },
                     remote_ports: vec![("edge://rejected-service".into(), 0)],
                 }),
+                revocation: None,
             };
             let digest = rejected.desired_state.digest().to_hex();
             assert_eq!(
@@ -4568,9 +3967,9 @@ mod tests {
     #[test]
     fn agent_socket_packets_preserve_ack_and_never_accept_a_path_execution_id() {
         let (ack, event, payload) =
-            super::parse_agent_socket_event("421[\"rpc-request\",{\"executionId\":\"exec-1\"}]")
+            super::parse_socket_io_event("421[\"rpc-request\",{\"executionId\":\"exec-1\"}]")
                 .expect("Socket.IO event");
-        assert_eq!(ack, Some("1"));
+        assert_eq!(ack.as_deref(), Some("1"));
         assert_eq!(event, "rpc-request");
         assert_eq!(payload["executionId"], "exec-1");
 
@@ -4711,14 +4110,14 @@ mod tests {
                 socket.send_text("40{\"sid\":\"socket\"}").await.unwrap();
                 let register =
                     String::from_utf8(socket.next().await.unwrap().unwrap().to_vec()).unwrap();
-                let (_, event, payload) = super::parse_agent_socket_event(&register).unwrap();
+                let (_, event, payload) = super::parse_socket_io_event(&register).unwrap();
                 assert_eq!(event, "rpc-register");
                 assert_eq!(payload["method"], "machine-loopback:orchestrator-dispatch");
                 socket.send_text("42[\"rpc-registered\",{}]").await.unwrap();
                 let cancel_register =
                     String::from_utf8(socket.next().await.unwrap().unwrap().to_vec()).unwrap();
                 let (_, event, payload) =
-                    super::parse_agent_socket_event(&cancel_register).unwrap();
+                    super::parse_socket_io_event(&cancel_register).unwrap();
                 assert_eq!(event, "rpc-register");
                 assert_eq!(payload["method"], "machine-loopback:orchestrator-cancel");
                 socket.send_text("42[\"rpc-registered\",{}]").await.unwrap();
@@ -4831,7 +4230,13 @@ mod tests {
             server.await.unwrap();
 
             for _ in 0..100 {
-                if super::test_agent_execution_reports().lock().unwrap().len() == 2 {
+                let execution_reports = super::test_agent_execution_reports()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(path, _)| path.contains("/executions/"))
+                    .count();
+                if execution_reports == 2 {
                     break;
                 }
                 hbb_common::tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4842,6 +4247,10 @@ mod tests {
             .lock()
             .unwrap()
             .clone();
+        let reports: Vec<_> = reports
+            .into_iter()
+            .filter(|(path, _)| path.contains("/executions/"))
+            .collect();
         assert_eq!(reports.len(), 2);
         assert_eq!(
             reports[0].0,

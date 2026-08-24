@@ -78,7 +78,7 @@ impl NexusRuntime {
         Ok(transition)
     }
 
-    /// Records an FRP start failure for the generation the native host owns.
+    /// Records an activation failure for the generation the native host owns.
     /// Deliberate cancellation is handled by `on_tunnel_drain_complete` instead.
     pub fn on_tunnel_activation_failed(
         &mut self,

@@ -15,7 +15,7 @@ pub enum VisitorProtocol {
 /// The only NAT-hole transports admitted for a signed XTCP visitor.
 ///
 /// This deliberately exposes no upstream retry, fallback, or STUN options;
-/// fixed safe defaults remain owned by the pinned FRP client revision.
+/// fixed safe defaults remain owned by the native transport implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum XtcpNatProtocol {
     Kcp,
@@ -41,7 +41,7 @@ pub struct TunnelVisitor {
     pub bind: SocketAddr,
     pub max_connections: u16,
     /// Opaque control-plane grant carried by the signed visitor assignment.
-    /// It is not rendered into FRP TOML; the Relay usage reporter consumes it.
+    /// It is not sent to the transport; the Relay usage reporter consumes it.
     pub grant_id: Option<String>,
 }
 
@@ -80,35 +80,6 @@ impl TunnelVisitor {
         Ok(())
     }
 
-    /// Renders the fixed upstream visitor subset; no plugin or arbitrary bind
-    /// settings are accepted from callers.
-    pub fn to_frp_toml(&self) -> Result<String, VisitorError> {
-        self.validate()?;
-        let protocol = match self.protocol {
-            VisitorProtocol::Stcp => "stcp",
-            VisitorProtocol::Sudp => "sudp",
-            VisitorProtocol::Xtcp => "xtcp",
-        };
-        Ok(format!(
-            "[[visitors]]\nname = \"{}\"\ntype = \"{protocol}\"\nserverName = \"{}\"\nserverUser = \"{}\"\nsecretKey = \"{}\"\nbindAddr = \"{}\"\nbindPort = {}\n",
-            self.visitor_id,
-            self.service_id,
-            self.server_device_uid,
-            self.secret,
-            self.bind.ip(),
-            self.bind.port(),
-        ))
-        .map(|mut rendered| {
-            if let Some(protocol) = self.xtcp_nat_protocol {
-                let protocol = match protocol {
-                    XtcpNatProtocol::Kcp => "kcp",
-                    XtcpNatProtocol::Quic => "quic",
-                };
-                rendered.push_str(&format!("protocol = \"{protocol}\"\n"));
-            }
-            rendered
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,7 +92,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn visitor_compiler_rejects_public_binds_and_renders_only_fixed_fields() {
+    fn visitor_validation_rejects_public_binds_and_invalid_xtcp_modes() {
         let visitor = TunnelVisitor {
             visitor_id: "visitor-1".into(),
             protocol: VisitorProtocol::Stcp,
@@ -134,10 +105,7 @@ mod tests {
             max_connections: 1,
             grant_id: None,
         };
-        let rendered = visitor.to_frp_toml().unwrap();
-        assert!(rendered.contains("type = \"stcp\""));
-        assert!(rendered.contains("bindAddr = \"127.0.0.1\""));
-        assert!(!rendered.contains("plugin"));
+        assert_eq!(visitor.validate(), Ok(()));
         let mut public = visitor;
         public.bind = "0.0.0.0:19000".parse().unwrap();
         assert_eq!(public.validate(), Err(VisitorError::InvalidVisitor));
@@ -152,11 +120,7 @@ mod tests {
             ..injected
         };
         xtcp.secret = "0123456789abcdef".into();
-        assert!(xtcp.to_frp_toml().unwrap().contains("type = \"xtcp\"\n"));
-        assert!(xtcp
-            .to_frp_toml()
-            .unwrap()
-            .contains("protocol = \"quic\"\n"));
+        assert_eq!(xtcp.validate(), Ok(()));
         xtcp.xtcp_nat_protocol = None;
         assert_eq!(xtcp.validate(), Err(VisitorError::InvalidVisitor));
     }

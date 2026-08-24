@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use nexus_tunnel_core::{
+use crate::{
     registration_signature_message, CookieChallengePayload, CookieRequestPayload, CpccAeadKey,
     CpccMessageType, CpccV2Frame, PresenceHeartbeat, RegistrationPayload,
 };
@@ -82,9 +82,6 @@ impl PresenceClient {
         let mut frame = self.frame(CpccMessageType::Register, key_id, registration.encode());
         registration.signature = sign(&registration_signature_message(&frame, &registration));
         frame.payload = registration.encode();
-        // UDP can drop the accepted registration response. Retrying the exact
-        // signed frame is safe: the Gateway treats the replay as idempotent
-        // and returns the same authenticated acknowledgement.
         for _ in 0..2 {
             self.send(&frame).await?;
             let acknowledgement =
