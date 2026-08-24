@@ -14,12 +14,12 @@ pub use protocol::*;
 pub(crate) mod application;
 pub mod infrastructure;
 mod transport;
+pub use application::{TunnelMetrics, TunnelRuntime, TunnelRuntimeConfigError};
 pub use transport::authi_socket::{
     agent_socket_endpoint, encode_socket_io_ack, encode_socket_io_event, parse_socket_io_event,
-    AgentCancellation, AgentDispatch, AgentExecutionFinish, AgentExecutionStart,
-    AgentRpcRequest, AgentRuntimeMetrics,
+    AgentCancellation, AgentDispatch, AgentExecutionFinish, AgentExecutionStart, AgentRpcRequest,
+    AgentRuntimeMetrics,
 };
-pub use application::{TunnelMetrics, TunnelRuntime, TunnelRuntimeConfigError};
 pub use transport::{PresenceClient, PresenceClientError};
 
 pub mod agent;

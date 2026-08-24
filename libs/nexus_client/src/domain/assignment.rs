@@ -89,7 +89,6 @@ impl CompiledTunnelConfig {
         proxy.local_addr = local_addr;
         Ok(())
     }
-
 }
 
 impl TunnelDataPlaneAssignment {
@@ -380,5 +379,4 @@ mod tests {
             ConfigCompileError::ConflictingRelayAuth
         );
     }
-
 }
